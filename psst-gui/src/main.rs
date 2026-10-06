@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 #![allow(clippy::new_without_default, clippy::type_complexity)]
 
 mod cmd;
@@ -6,6 +6,7 @@ mod controller;
 mod data;
 mod delegate;
 mod error;
+mod splitify;
 mod ui;
 mod webapi;
 mod widget;
@@ -25,6 +26,13 @@ const ENV_LOG: &str = "PSST_LOG";
 const ENV_LOG_STYLE: &str = "PSST_LOG_STYLE";
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        let _ = windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
+            windows::core::w!("com.angelopol.xpotify"),
+        );
+    }
+    let _ = dotenvy::from_filename(".env.local");
     // Setup logging from the env variables, with defaults.
     Builder::from_env(
         Env::new()
@@ -33,8 +41,16 @@ fn main() {
     )
     .init();
 
+    #[cfg(debug_assertions)]
+    if ui::run_if_requested() {
+        return;
+    }
+
     // Load configuration
-    let config = Config::load().unwrap_or_default();
+    let mut config = Config::load().unwrap_or_default();
+    if config.webapi_client_id_value().is_none() {
+        config.webapi_client_id = std::env::var("SPOTIFY_CLIENT_ID").ok();
+    }
 
     let paginated_limit = config.paginated_limit;
     let mut state = AppState::default_with_config(config.clone());

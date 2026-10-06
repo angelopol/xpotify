@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
     fmt::Display,
+    hash::{Hash, Hasher},
     io::{self, Read},
     path::PathBuf,
     sync::Arc,
     thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use druid::{
@@ -50,12 +51,481 @@ use crate::{
 use super::{cache::WebApiCache, local::LocalTrackManager};
 use sanitize_html::{rules::predefined::DEFAULT, sanitize_str};
 
+fn trusted_api_destination(url: &url::Url) -> bool {
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port_or_known_default() == Some(443)
+        && matches!(
+            url.host_str(),
+            Some("api.spotify.com" | "api-partner.spotify.com" | "spclient.wg.spotify.com")
+        )
+}
+
+impl WebApi {
+    pub fn get_devices(&self) -> Result<Vector<data::connect::Device>, Error> {
+        #[derive(Deserialize)]
+        struct Devices {
+            devices: Vector<data::connect::Device>,
+        }
+        let result: Devices = self.load(&RequestBuilder::new(
+            "v1/me/player/devices",
+            Method::Get,
+            None,
+        ))?;
+        Ok(result.devices)
+    }
+
+    pub fn followed_artist_news(&self) -> Result<data::news::NewsFeed, Error> {
+        log::info!("Loading followed artist releases");
+        #[derive(Deserialize)]
+        struct Cursor {
+            after: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Artists {
+            items: Vec<Artist>,
+            cursors: Cursor,
+            next: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Following {
+            artists: Artists,
+        }
+        let mut followed = Vec::new();
+        let mut after = None;
+        let mut cursors = std::collections::HashSet::new();
+        loop {
+            let mut request = RequestBuilder::new("v1/me/following", Method::Get, None)
+                .query("type", "artist")
+                .query("limit", "50");
+            if let Some(after) = &after {
+                request = request.query("after", after);
+            }
+            let page: Following = self.load(&request)?;
+            followed.extend(page.artists.items);
+            if page.artists.next.is_none() {
+                break;
+            }
+            after = page.artists.cursors.after;
+            if after
+                .as_ref()
+                .is_none_or(|after| !cursors.insert(after.clone()))
+            {
+                break;
+            }
+        }
+        #[derive(Deserialize)]
+        struct Albums {
+            items: Vec<Arc<Album>>,
+        }
+        let cutoff = time::OffsetDateTime::now_utc().date() - time::Duration::days(90);
+        let mut releases = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut failed = 0;
+        // Four bounded readers; Spotify credentials never leave the official API host.
+        log::info!("Loading releases from {} followed artists", followed.len());
+        for (batch_index, batch) in followed.chunks(4).enumerate() {
+            let results = thread::scope(|scope| {
+                let workers: Vec<_> = batch
+                    .iter()
+                    .map(|artist| {
+                        scope.spawn(move || {
+                            let request = RequestBuilder::new(
+                                format!("v1/artists/{}/albums", artist.id),
+                                Method::Get,
+                                None,
+                            )
+                            .query("include_groups", "album,single")
+                            .query("limit", "20")
+                            .query("market", "from_token");
+                            (artist, self.news_albums::<Albums>(&artist.id, &request))
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .filter_map(|worker| worker.join().ok())
+                    .collect::<Vec<_>>()
+            });
+            for (artist, result) in results {
+                match result {
+                    Ok(albums) => {
+                        for album in albums.items {
+                            if album.release_date.is_some_and(|date| {
+                                date >= cutoff && date <= time::OffsetDateTime::now_utc().date()
+                            }) && seen.insert(album.id.clone())
+                            {
+                                releases.push(data::news::Release {
+                                    date: album.release_date.unwrap().to_string(),
+                                    album,
+                                    artist: artist.name.to_string(),
+                                    unread: true,
+                                });
+                            }
+                        }
+                    }
+                    Err(_) => failed += 1,
+                }
+            }
+            log::info!(
+                "Release lookup: {} of {} artists, {} recent releases, {} failures",
+                ((batch_index + 1) * 4).min(followed.len()),
+                followed.len(),
+                releases.len(),
+                failed
+            );
+        }
+        releases.sort_by(|a, b| b.date.cmp(&a.date).then(a.album.name.cmp(&b.album.name)));
+        Ok(data::news::NewsFeed {
+            releases: releases.into_iter().take(300).collect(),
+            followed_count: followed.len(),
+            failed_count: failed,
+            notice: self.news_quota_until.lock().and_then(|until| until.duration_since(SystemTime::now()).ok()).map(|delay| format!("Spotify ha limitado las consultas de lanzamientos. Vuelve a actualizar dentro de aproximadamente {} horas. Se muestran los datos disponibles en cach\u{00e9}.", delay.as_secs().div_ceil(3600))).unwrap_or_default(),
+        })
+    }
+
+    fn news_albums<T: DeserializeOwned>(
+        &self,
+        id: &str,
+        request: &RequestBuilder,
+    ) -> Result<T, Error> {
+        if id.len() != 22 || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(Error::WebApiError("Invalid artist ID".into()));
+        }
+        let cached = || {
+            self.cache
+                .get("artist-releases", id)
+                .and_then(|file| serde_json::from_reader(file).ok())
+        };
+        let quota_active = self
+            .news_quota_until
+            .lock()
+            .is_some_and(|until| until > SystemTime::now());
+        let fresh = self
+            .cache
+            .get("artist-releases", id)
+            .and_then(|file| file.metadata().ok())
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age < Duration::from_secs(6 * 3600));
+        if quota_active || fresh {
+            if let Some(value) = cached() {
+                return Ok(value);
+            }
+            if quota_active {
+                return Err(Error::WebApiError(
+                    "Spotify HTTP 429: release quota exhausted".into(),
+                ));
+            }
+        }
+        let mut response = match self.request(request) {
+            Ok(response) => response,
+            Err(error @ Error::RateLimited { retry_at, .. }) => {
+                *self.news_quota_until.lock() =
+                    UNIX_EPOCH.checked_add(Duration::from_secs(retry_at));
+                self.cache.set(
+                    "artist-releases",
+                    "quota-until",
+                    retry_at.to_string().as_bytes(),
+                );
+                return cached().ok_or(error);
+            }
+            Err(error) if Self::temporary_api_error(&error) => return cached().ok_or(error),
+            Err(error) => return Err(error),
+        };
+        let value: serde_json::Value = response
+            .body_mut()
+            .with_config()
+            .limit(2 * 1024 * 1024)
+            .read_json()?;
+        let parsed = serde_json::from_value(value.clone())?;
+        self.cache
+            .set("artist-releases", id, &serde_json::to_vec(&value)?);
+        Ok(parsed)
+    }
+
+    pub fn remote_playback(&self) -> Result<Option<data::connect::RemotePlayback>, Error> {
+        let mut response = Self::with_retry(|| {
+            self.request(
+                &RequestBuilder::new("v1/me/player", Method::Get, None)
+                    .query("additional_types", "track"),
+            )
+        })?;
+        if response.status().as_u16() == 204 {
+            return Ok(None);
+        }
+        response
+            .body_mut()
+            .with_config()
+            .limit(2 * 1024 * 1024)
+            .read_json()
+            .map(Some)
+            .map_err(|_| Error::WebApiError("No se pudo leer el estado del dispositivo.".into()))
+    }
+
+    pub fn remote_queue(&self) -> Result<druid::im::Vector<data::Playable>, Error> {
+        let value: serde_json::Value = self.load(&RequestBuilder::new(
+            "v1/me/player/queue",
+            Method::Get,
+            None,
+        ))?;
+        Ok(value["queue"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| {
+                serde_json::from_value::<data::Track>(value.clone())
+                    .ok()
+                    .map(|track| data::Playable::Track(Arc::new(track)))
+            })
+            .collect())
+    }
+
+    pub fn remote_action(&self, action: &data::connect::RemoteRequest) -> Result<(), Error> {
+        let json_body = || {
+            serde_json::from_str::<serde_json::Value>(&action.body)
+                .map_err(|_| Error::WebApiError("Solicitud de reproducción inválida.".into()))
+        };
+        let send = |path: &str, method: Method, body| {
+            self.send_empty_json(
+                &RequestBuilder::new(path, method, body).query("device_id", &action.device_id),
+            )
+        };
+        match action.kind.as_str() {
+            "transfer" | "switch-play" => {
+                let already_active = self.get_devices()?.iter().any(|device| {
+                    device.id.as_ref() == Some(&action.device_id) && device.is_active
+                });
+                if !already_active {
+                    self.send_empty_json(&RequestBuilder::new(
+                        "v1/me/player",
+                        Method::Put,
+                        Some(json!({"device_ids":[action.device_id],"play":false})),
+                    ))?;
+                }
+                if already_active
+                    && action.kind == "transfer"
+                    && self.remote_playback()?.is_some_and(|playback| {
+                        playback.is_playing
+                            && playback.device.id.as_ref() == Some(&action.device_id)
+                    })
+                {
+                    send("v1/me/player/pause", Method::Put, None)?;
+                }
+                if action.kind == "switch-play" {
+                    send("v1/me/player/play", Method::Put, Some(json_body()?))?;
+                }
+                Ok(())
+            }
+            "play" => send("v1/me/player/play", Method::Put, Some(json_body()?)),
+            "resume" => send("v1/me/player/play", Method::Put, None),
+            "pause" => send("v1/me/player/pause", Method::Put, None),
+            "next" => send("v1/me/player/next", Method::Post, None),
+            "previous" => send("v1/me/player/previous", Method::Post, None),
+            "seek" => self.send_empty_json(
+                &RequestBuilder::new("v1/me/player/seek", Method::Put, None)
+                    .query("device_id", &action.device_id)
+                    .query("position_ms", &action.value),
+            ),
+            "volume" => self.send_empty_json(
+                &RequestBuilder::new("v1/me/player/volume", Method::Put, None)
+                    .query("device_id", &action.device_id)
+                    .query("volume_percent", &action.value),
+            ),
+            "behavior" => {
+                self.send_empty_json(
+                    &RequestBuilder::new("v1/me/player/shuffle", Method::Put, None)
+                        .query("device_id", &action.device_id)
+                        .query("state", &action.body),
+                )?;
+                self.send_empty_json(
+                    &RequestBuilder::new("v1/me/player/repeat", Method::Put, None)
+                        .query("device_id", &action.device_id)
+                        .query("state", &action.value),
+                )
+            }
+            "shuffle" => self.send_empty_json(
+                &RequestBuilder::new("v1/me/player/shuffle", Method::Put, None)
+                    .query("device_id", &action.device_id)
+                    .query("state", &action.value),
+            ),
+            "repeat" => self.send_empty_json(
+                &RequestBuilder::new("v1/me/player/repeat", Method::Put, None)
+                    .query("device_id", &action.device_id)
+                    .query("state", &action.value),
+            ),
+            "queue" => self.send_empty_json(
+                &RequestBuilder::new("v1/me/player/queue", Method::Post, None)
+                    .query("device_id", &action.device_id)
+                    .query("uri", &action.value),
+            ),
+            _ => Err(Error::WebApiError(
+                "Acción de dispositivo desconocida.".into(),
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod credential_destination_tests {
+    use super::*;
+    #[test]
+    fn cooldown_survives_restart_and_refresh_and_preserves_stale_data() {
+        let path = std::env::temp_dir().join(format!(
+            "xpotify-quota-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let api = WebApi::new(Some("http://127.0.0.1:9"), Some(path.clone()), 5000);
+        api.set_webapi_credentials(
+            Some("test-client".into()),
+            Some(WebApiToken {
+                access_token: "test-access".into(),
+                refresh_token: Some("test-refresh".into()),
+                expires_at: u64::MAX,
+            }),
+        );
+        let request = RequestBuilder::new("v1/me/tracks", Method::Get, None);
+        let until = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        api.cache.set(
+            "request-limits",
+            &api.rate_limit_key(&request),
+            &serde_json::to_vec(&until).unwrap(),
+        );
+        let key = api.response_key(&request).unwrap();
+        api.cache
+            .set("responses", &key, br#"{"items":["cached-track"]}"#);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path.join("responses").join(&key))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH))
+            .unwrap();
+        let start = Instant::now();
+        assert!(matches!(
+            api.request(&request),
+            Err(Error::RateLimited { .. })
+        ));
+        let cached: serde_json::Value = api.load(&request).unwrap();
+        assert_eq!(cached["items"][0], "cached-track");
+        assert!(api.invalidate_metadata().is_err());
+        assert!(api.cache.get("responses", &key).is_some());
+        let restarted = WebApi::new(None, Some(path.clone()), 5000);
+        restarted.set_webapi_credentials(Some("test-client".into()), None);
+        assert!(matches!(
+            restarted.request(&request),
+            Err(Error::RateLimited { .. })
+        ));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        api.cache
+            .set("request-limits", &api.rate_limit_key(&request), b"0");
+        assert!(api.check_rate_limit(&request).is_ok());
+        restarted.set_webapi_credentials(Some("another-client".into()), None);
+        assert!(restarted.check_rate_limit(&request).is_ok());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn cache_keys_are_stable_across_query_order_and_separate_sessions() {
+        let api = WebApi::new(None, None, 5000);
+        *api.webapi_token.lock() = Some(WebApiToken {
+            access_token: "test-access".into(),
+            refresh_token: Some("test-account-a".into()),
+            expires_at: u64::MAX,
+        });
+        let first = RequestBuilder::new("v1/me/tracks", Method::Get, None)
+            .query("limit", 50)
+            .query("offset", 0);
+        let reordered = RequestBuilder::new("v1/me/tracks", Method::Get, None)
+            .query("offset", 0)
+            .query("limit", 50);
+        let key = api.response_key(&first).unwrap();
+        assert_eq!(Some(key.clone()), api.response_key(&reordered));
+        api.webapi_token.lock().as_mut().unwrap().access_token = "rotated-access-token".into();
+        assert_eq!(Some(key.clone()), api.response_key(&first));
+        api.webapi_token.lock().as_mut().unwrap().refresh_token = Some("test-account-b".into());
+        assert_ne!(Some(key), api.response_key(&first));
+        assert!(!WebApi::temporary_api_error(&Error::WebApiError(
+            "http status: 403".into()
+        )));
+        assert!(!WebApi::temporary_api_error(&Error::WebApiError(
+            "http status: 401".into()
+        )));
+        assert!(WebApi::temporary_api_error(&Error::WebApiError(
+            "http status: 503".into()
+        )));
+    }
+    #[test]
+    fn exhausted_release_quota_returns_without_network_or_sleep() {
+        let api = WebApi::new(None, None, 5000);
+        *api.news_quota_until.lock() = Some(SystemTime::now() + Duration::from_secs(86400));
+        let request = RequestBuilder::new("v1/artists/example/albums", Method::Get, None);
+        let start = std::time::Instant::now();
+        let result = api.news_albums::<serde_json::Value>("5lfWrciYtohtIMVDVZd0Rf", &request);
+        assert!(result.unwrap_err().to_string().contains("429"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(api
+            .news_albums::<serde_json::Value>("../escape", &request)
+            .is_err());
+    }
+    #[test]
+    fn library_mutations_use_current_endpoint_and_encoded_spotify_uri() {
+        for kind in ["track", "album", "show", "playlist"] {
+            for method in [Method::Put, Method::Delete] {
+                let request = RequestBuilder::library_item(kind, "5lfWrciYtohtIMVDVZd0Rf", method);
+                let uri = url::Url::parse(&request.build()).unwrap();
+                assert_eq!(uri.path(), "/v1/me/library");
+                assert_eq!(
+                    uri.query_pairs().collect::<Vec<_>>(),
+                    [(
+                        "uris".into(),
+                        format!("spotify:{kind}:5lfWrciYtohtIMVDVZd0Rf").into()
+                    )]
+                );
+                assert!(request.body.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn only_official_https_api_hosts_receive_credentials() {
+        for trusted in [
+            "https://api.spotify.com/v1/me",
+            "https://api-partner.spotify.com/pathfinder/v1/query",
+            "https://spclient.wg.spotify.com/track-credits-view/",
+        ] {
+            assert!(trusted_api_destination(&url::Url::parse(trusted).unwrap()));
+        }
+        for rejected in [
+            "http://ip-api.com/json",
+            "https://i.scdn.co/image/cover",
+            "http://api.spotify.com/v1/me",
+            "https://api.spotify.com.evil.example/v1/me",
+            "https://api.spotify.com@evil.example/v1/me",
+            "https://api.spotify.com:8888/v1/me",
+        ] {
+            assert!(!trusted_api_destination(
+                &url::Url::parse(rejected).unwrap()
+            ));
+        }
+    }
+}
+
 pub struct WebApi {
     agent: Agent,
     cache: WebApiCache,
     local_track_manager: Mutex<LocalTrackManager>,
     paginated_limit: usize,
     webapi_token: Mutex<Option<WebApiToken>>,
+    news_quota_until: Mutex<Option<SystemTime>>,
+    response_origins: Mutex<HashMap<String, SystemTime>>,
+    request_gate: Mutex<Instant>,
+    response_load: Mutex<()>,
+    read_failures: Mutex<HashMap<String, (Instant, Error)>>,
     webapi_client_id: Mutex<Option<String>>,
     // First-party session credentials, used for `api-partner.spotify.com`
     // (pathfinder GraphQL) calls, which reject the Web API OAuth token.
@@ -70,15 +540,28 @@ impl WebApi {
         cache_base: Option<PathBuf>,
         paginated_limit: usize,
     ) -> Self {
-        let mut agent = Agent::config_builder().timeout_global(Some(Duration::from_secs(5)));
+        let mut agent = Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .max_redirects(0)
+            .http_status_as_error(false);
         if let Some(proxy_url) = proxy_url {
             let proxy = ureq::Proxy::new(proxy_url).ok();
             agent = agent.proxy(proxy);
         }
+        let cache = WebApiCache::new(cache_base);
+        let news_quota_until = cache
+            .get("artist-releases", "quota-until")
+            .and_then(|file| serde_json::from_reader::<_, u64>(file).ok())
+            .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)));
         let client_token_provider = ClientTokenProvider::new_shared(proxy_url);
         Self {
             agent: agent.build().into(),
-            cache: WebApiCache::new(cache_base),
+            cache,
+            news_quota_until: Mutex::new(news_quota_until),
+            response_origins: Mutex::new(HashMap::new()),
+            request_gate: Mutex::new(Instant::now()),
+            response_load: Mutex::new(()),
+            read_failures: Mutex::new(HashMap::new()),
             local_track_manager: Mutex::new(LocalTrackManager::new()),
             paginated_limit,
             webapi_token: Mutex::new(None),
@@ -120,11 +603,10 @@ impl WebApi {
     /// the Login5 access token from the core session plus a protobuf client
     /// token — the same credentials the web player and `Cdn` use.
     fn partner_token(&self) -> Result<(String, String), Error> {
-        let session = self
-            .session
-            .lock()
-            .clone()
-            .ok_or_else(|| Error::WebApiError("No active session for api-partner".to_string()))?;
+        let session =
+            self.session.lock().clone().ok_or_else(|| {
+                Error::WebApiError("No active session for api-partner".to_string())
+            })?;
         let access_token = self
             .login5
             .get_access_token(&session)
@@ -170,6 +652,20 @@ impl WebApi {
     }
 
     fn request(&self, request: &RequestBuilder) -> Result<Response<Body>, Error> {
+        let destination = url::Url::parse(&request.build())
+            .map_err(|_| Error::WebApiError("Invalid API URL".into()))?;
+        if !trusted_api_destination(&destination) {
+            return Err(Error::WebApiError(
+                "Refusing to send Spotify credentials to an untrusted destination".into(),
+            ));
+        }
+        // One dispatch at a time prevents parallel workers from producing bursts.
+        // Check the persisted cooldown again after obtaining the permit.
+        let mut permit = self.request_gate.lock();
+        self.check_rate_limit(request)?;
+        if let Some(wait) = permit.checked_duration_since(Instant::now()) {
+            thread::sleep(wait);
+        }
         // `api-partner.spotify.com` rejects the Web API OAuth token, so those
         // requests carry the first-party Login5 bearer + client-token instead.
         let (token, client_token) = if request.partner_auth {
@@ -190,47 +686,115 @@ impl WebApi {
             if let Some(client_token) = client_token {
                 req = req.header("client-token", client_token);
             }
-            headers.iter().fold(
-                req, |current_req, (k, v)| current_req.header(k, v)
-            )
+            headers
+                .iter()
+                .fold(req, |current_req, (k, v)| current_req.header(k, v))
         }
 
         let ct = client_token.as_deref();
         let headers = request.get_headers();
-        match request.get_method() {
-            Method::Get => configure_request(self.agent.get(&url), &token, ct, headers)
-                .call()
-                .map_err(|err| Error::WebApiError(err.to_string())),
-            Method::Post => configure_request(self.agent.post(&url), &token, ct, headers)
-                .send_json(request.get_body())
-                .map_err(|err| Error::WebApiError(err.to_string())),
-            Method::Put => configure_request(self.agent.put(&url), &token, ct, headers)
-                .send_json(request.get_body())
-                .map_err(|err| Error::WebApiError(err.to_string())),
-            Method::Delete => configure_request(self.agent.delete(&url), &token, ct, headers)
-                .force_send_body()
-                .send_json(request.get_body())
-                .map_err(|err| Error::WebApiError(err.to_string())),
+        let send_request = || match request.get_method() {
+            Method::Get => configure_request(self.agent.get(&url), &token, ct, headers).call(),
+            Method::Post => {
+                let req = configure_request(self.agent.post(&url), &token, ct, headers);
+                match request.get_body() {
+                    Some(body) => req.send_json(body),
+                    None => req.send_empty(),
+                }
+            }
+            Method::Put => {
+                let req = configure_request(self.agent.put(&url), &token, ct, headers);
+                match request.get_body() {
+                    Some(body) => req.send_json(body),
+                    None => req.send_empty(),
+                }
+            }
+            Method::Delete => {
+                let req = configure_request(self.agent.delete(&url), &token, ct, headers);
+                match request.get_body() {
+                    Some(body) => req.force_send_body().send_json(body),
+                    None => req.call(),
+                }
+            }
+        };
+        let safe = matches!(request.get_method(), Method::Get);
+        let result = super::retry::run(send_request, safe, thread::sleep);
+        let mut response = result.map_err(|err| Error::WebApiError(err.to_string()))?;
+        *permit = Instant::now() + Duration::from_millis(300);
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            let seconds = response
+                .headers()
+                .get("Retry-After")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(60)
+                .max(1);
+            let until = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_add(seconds);
+            self.cache.set(
+                "request-limits",
+                &self.rate_limit_key(request),
+                &serde_json::to_vec(&until)?,
+            );
+            return Err(Error::rate_limited(until));
         }
+        if (response.status().is_client_error() || response.status().is_server_error())
+            && response.status() != StatusCode::TOO_MANY_REQUESTS
+        {
+            let status = response.status().as_u16();
+            let message = response
+                .body_mut()
+                .with_config()
+                .limit(16_384)
+                .read_json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(String::from))
+                .unwrap_or_else(|| "Spotify rechaz\u{00f3} la solicitud".into());
+            let message: String = message
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(240)
+                .collect();
+            return Err(Error::WebApiError(format!(
+                "Spotify HTTP {status} ({}): {message}",
+                destination.path()
+            )));
+        }
+        if response.status().is_success()
+            && request.base_uri == "api.spotify.com"
+            && !matches!(request.method, Method::Get)
+            && !request.path.starts_with("v1/me/player")
+        {
+            if let Err(error) = self.invalidate_metadata() {
+                log::warn!("Metadata invalidation failed: {error}");
+            }
+        }
+        Ok(response)
     }
 
     fn with_retry(f: impl Fn() -> Result<Response<Body>, Error>) -> Result<Response<Body>, Error> {
-        loop {
+        for attempt in 0..3 {
             let response = f()?;
-            match response.status() {
-                StatusCode::TOO_MANY_REQUESTS => {
-                    let retry_after_secs = response
-                        .headers()
-                        .get("Retry-After")
-                        .and_then(|secs| secs.to_str().ok());
-                    let secs = retry_after_secs.unwrap_or("2").parse::<u64>().unwrap_or(2);
-                    thread::sleep(Duration::from_secs(secs));
-                }
-                _ => {
-                    break Ok(response);
-                }
+            if response.status() != StatusCode::TOO_MANY_REQUESTS {
+                return Ok(response);
             }
+            let seconds = response
+                .headers()
+                .get("Retry-After")
+                .and_then(|header| header.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(2);
+            if seconds > 5 || attempt == 2 {
+                return Err(Error::WebApiError(format!(
+                    "Spotify HTTP 429. Vuelve a intentarlo en {seconds} segundos."
+                )));
+            }
+            thread::sleep(Duration::from_secs(seconds.max(1)));
         }
+        unreachable!()
     }
 
     /// Send a request with an empty JSON object, throw away the response body.
@@ -242,11 +806,265 @@ impl WebApi {
     /// Send a request and return the deserialized JSON body.  Use for GET
     /// requests.
     fn load<T: DeserializeOwned>(&self, request: &RequestBuilder) -> Result<T, Error> {
-        let mut response = Self::with_retry(|| self.request(request))?;
-        response
-            .body_mut()
-            .read_json()
-            .map_err(|err| Error::WebApiError(err.to_string()))
+        // Recheck the cache after a competing load finishes instead of fetching twice.
+        let _load = self.response_load.lock();
+        let cacheable = matches!(request.method, Method::Get)
+            && !request.path.starts_with("v1/me/player")
+            && !request.path.ends_with("/contains");
+        let key = if cacheable {
+            self.response_key(request)
+        } else {
+            None
+        };
+        let mut old = None;
+        if let Some(key) = &key {
+            if let Some(file) = self.cache.get("responses", key) {
+                let modified = file.metadata().ok().and_then(|meta| meta.modified().ok());
+                if let Ok(value) = serde_json::from_reader(file) {
+                    if modified
+                        .and_then(|time| time.elapsed().ok())
+                        .is_some_and(|age| age < Duration::from_secs(900))
+                    {
+                        if let Some(time) = modified {
+                            self.response_origins.lock().insert(request.build(), time);
+                        }
+                        return Ok(value);
+                    }
+                    old = Some((value, modified));
+                }
+            }
+        }
+        if old.is_none() && (request.path == "v1/me" || request.path == "v1/me/playlists") {
+            if let Some(file) = key
+                .as_ref()
+                .and_then(|key| self.cache.get("library-snapshots", key))
+            {
+                let modified = file.metadata().ok().and_then(|meta| meta.modified().ok());
+                if modified
+                    .and_then(|time| time.elapsed().ok())
+                    .is_some_and(|age| age < Duration::from_secs(14 * 86400))
+                {
+                    if let Ok(value) = serde_json::from_reader(file) {
+                        old = Some((value, modified));
+                    }
+                }
+            }
+        }
+        // Never launch another failing GET immediately when navigating back to a view.
+        let result = if let Some((_, error)) = self
+            .read_failures
+            .lock()
+            .get(&request.build())
+            .filter(|(at, _)| {
+                matches!(request.method, Method::Get) && at.elapsed() < Duration::from_secs(30)
+            }) {
+            Err(error.clone())
+        } else {
+            self.request_json(request)
+        };
+        match result {
+            Ok(value) => {
+                let parsed = serde_json::from_value(value.clone())?;
+                if let Some(key) = key {
+                    self.cache
+                        .set("responses", &key, &serde_json::to_vec(&value)?);
+                    // Keep the last known library even after an explicit metadata refresh.
+                    if request.path == "v1/me" || request.path == "v1/me/playlists" {
+                        self.cache
+                            .set("library-snapshots", &key, &serde_json::to_vec(&value)?);
+                    }
+                }
+                self.read_failures.lock().remove(&request.build());
+                self.response_origins.lock().remove(&request.build());
+                Ok(parsed)
+            }
+            Err(error) if Self::temporary_api_error(&error) && old.is_some() => {
+                let (value, modified) = old.unwrap();
+                if let Some(time) = modified {
+                    self.response_origins.lock().insert(request.build(), time);
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                if matches!(request.method, Method::Get)
+                    && Self::temporary_api_error(&error)
+                    && !matches!(error, Error::RateLimited { .. })
+                {
+                    let mut failures = self.read_failures.lock();
+                    failures.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(30));
+                    if failures.len() < 128 {
+                        failures.insert(request.build(), (Instant::now(), error.clone()));
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn request_json(&self, request: &RequestBuilder) -> Result<serde_json::Value, Error> {
+        for attempt in 0..3 {
+            let mut response = Self::with_retry(|| self.request(request))?;
+            match response
+                .body_mut()
+                .with_config()
+                .limit(16 * 1024 * 1024)
+                .read_json()
+            {
+                Ok(value) => return Ok(value),
+                Err(error)
+                    if matches!(request.method, Method::Get)
+                        && super::retry::transient(&error)
+                        && attempt < 2 =>
+                {
+                    thread::sleep(Duration::from_millis(250 * (attempt + 1)));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("bounded retry returns on final attempt")
+    }
+
+    fn temporary_api_error(error: &Error) -> bool {
+        if matches!(error, Error::RateLimited { .. }) {
+            return true;
+        }
+        let message = error.to_string().to_lowercase();
+        [
+            "timeout",
+            "timed out",
+            "connection",
+            "host not found",
+            "429",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "http status: 500",
+            "http status: 502",
+            "http status: 503",
+            "http status: 504",
+        ]
+        .iter()
+        .any(|term| message.contains(term))
+    }
+
+    fn response_key(&self, request: &RequestBuilder) -> Option<String> {
+        let guard = self.webapi_token.lock();
+        let token = guard.as_ref()?;
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        token
+            .refresh_token
+            .as_ref()
+            .unwrap_or(&token.access_token)
+            .hash(&mut hash);
+        request.build().hash(&mut hash);
+        Some(format!("{:016x}", hash.finish()))
+    }
+
+    pub fn invalidate_metadata(&self) -> Result<(), Error> {
+        self.check_rate_limit(&RequestBuilder::new("v1/me", Method::Get, None))?;
+        self.cache.invalidate_metadata()?;
+        self.response_origins.lock().clear();
+        self.read_failures.lock().clear();
+        Ok(())
+    }
+
+    fn invalidate_pages(&self, request: &RequestBuilder) -> Result<(), Error> {
+        for offset in (0..self.paginated_limit).step_by(50) {
+            let request = request
+                .clone()
+                .query("limit", 50.min(self.paginated_limit - offset))
+                .query("offset", offset);
+            if let Some(key) = self.response_key(&request) {
+                self.cache.remove("responses", &key)?;
+            }
+            self.read_failures.lock().remove(&request.build());
+            self.response_origins.lock().remove(&request.build());
+        }
+        Ok(())
+    }
+
+    pub fn invalidate_playlist(&self, id: &str) -> Result<(), Error> {
+        let request = RequestBuilder::new(format!("v1/playlists/{id}"), Method::Get, None);
+        self.check_rate_limit(&request)?;
+        if let Some(key) = self.response_key(&request) {
+            self.cache.remove("responses", &key)?;
+        }
+        self.read_failures.lock().remove(&request.build());
+        self.response_origins.lock().remove(&request.build());
+        self.invalidate_pages(
+            &RequestBuilder::new(format!("v1/playlists/{id}/items"), Method::Get, None)
+                .query("marker", "from_token")
+                .query("additional_types", "track"),
+        )
+    }
+
+    pub fn invalidate_route(&self, nav: &Nav) -> Result<(), Error> {
+        if let Nav::PlaylistDetail(link) = nav {
+            return self.invalidate_playlist(&link.id);
+        }
+        let request = match nav {
+            Nav::SavedTracks => Some(
+                RequestBuilder::new("v1/me/tracks", Method::Get, None)
+                    .query("market", "from_token"),
+            ),
+            Nav::SavedAlbums => Some(
+                RequestBuilder::new("v1/me/albums", Method::Get, None)
+                    .query("market", "from_token"),
+            ),
+            Nav::Shows => Some(RequestBuilder::new("v1/me/shows", Method::Get, None)),
+            _ => None,
+        };
+        if let Some(request) = request {
+            self.check_rate_limit(&request)?;
+            self.invalidate_pages(&request)
+        } else {
+            self.invalidate_metadata()
+        }
+    }
+
+    fn rate_limit_key(&self, request: &RequestBuilder) -> String {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        request.base_uri.hash(&mut hash);
+        request.partner_auth.hash(&mut hash);
+        self.webapi_client_id.lock().hash(&mut hash);
+        // The quota belongs to the application; refreshing OAuth must not reset it.
+        format!("{:016x}", hash.finish())
+    }
+
+    fn check_rate_limit(&self, request: &RequestBuilder) -> Result<(), Error> {
+        if let Some(until) = self
+            .cache
+            .get("request-limits", &self.rate_limit_key(request))
+            .and_then(|file| serde_json::from_reader::<_, u64>(file).ok())
+        {
+            let error = Error::rate_limited(until);
+            if error.retry_blocked() {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn rate_limit_error(&self) -> Option<Error> {
+        self.check_rate_limit(&RequestBuilder::new("v1/me/player", Method::Get, None))
+            .err()
+    }
+
+    pub fn cache_origin(&self, nav: &data::Nav) -> Option<SystemTime> {
+        let prefix = match nav {
+            data::Nav::PlaylistDetail(link) => format!("v1/playlists/{}", link.id),
+            data::Nav::SavedTracks => "v1/me/tracks".into(),
+            data::Nav::SavedAlbums => "v1/me/albums".into(),
+            data::Nav::SearchResults(_) => "v1/search".into(),
+            _ => return None,
+        };
+        self.response_origins
+            .lock()
+            .iter()
+            .filter(|(path, _)| path.starts_with(&format!("https://api.spotify.com/{prefix}")))
+            .map(|(_, time)| *time)
+            .min()
     }
 
     /// Send a request using `self.load()`, but only if it isn't already present
@@ -257,21 +1075,31 @@ impl WebApi {
         bucket: &str,
         key: &str,
     ) -> Result<Cached<T>, Error> {
+        let mut old = None;
         if let Some(file) = self.cache.get(bucket, key) {
-            let cached_at = file.metadata()?.modified()?;
-            let value = serde_json::from_reader(file)?;
-            Ok(Cached::new(value, cached_at))
-        } else {
-            let response = Self::with_retry(|| self.request(request))?;
-            let body = {
-                let mut reader = response.into_body().into_reader();
-                let mut body = Vec::new();
-                reader.read_to_end(&mut body)?;
-                body
-            };
-            let value = serde_json::from_slice(&body)?;
-            self.cache.set(bucket, key, &body);
-            Ok(Cached::fresh(value))
+            let modified = file.metadata().ok().and_then(|meta| meta.modified().ok());
+            if let (Some(time), Ok(value)) = (modified, serde_json::from_reader::<_, T>(file)) {
+                if time
+                    .elapsed()
+                    .ok()
+                    .is_some_and(|age| age < Duration::from_secs(86400))
+                {
+                    return Ok(Cached::new(value, time));
+                }
+                old = Some((value, time));
+            }
+        }
+        match self.request_json(request) {
+            Ok(value) => {
+                let parsed = serde_json::from_value(value.clone())?;
+                self.cache.set(bucket, key, &serde_json::to_vec(&value)?);
+                Ok(Cached::fresh(parsed))
+            }
+            Err(error) if Self::temporary_api_error(&error) && old.is_some() => {
+                let (value, time) = old.unwrap();
+                Ok(Cached::new(value, time))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -282,29 +1110,31 @@ impl WebApi {
         request: &RequestBuilder,
         mut func: impl FnMut(Page<T>) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        // TODO: Some result sets, like very long playlists and saved tracks/albums can
-        // be very big.  Implement virtualized scrolling and lazy-loading of results.
-        let mut limit = 50;
         let mut offset = 0;
-        loop {
+        while offset < self.paginated_limit {
+            let limit = 50.min(self.paginated_limit - offset);
             let req = request
                 .clone()
-                .query("limit".to_string(), limit.to_string())
-                .query("offset".to_string(), offset.to_string());
+                .query("limit", limit)
+                .query("offset", offset);
             let page: Page<T> = self.load(&req)?;
-
-            let page_total = page.total;
-            let page_offset = page.offset;
-            let page_limit = page.limit;
-            func(page)?;
-
-            if page_total > offset && offset < self.paginated_limit {
-                limit = page_limit;
-                offset = page_offset + page_limit;
-            } else {
-                break Ok(());
+            if page.offset != offset || page.limit == 0 {
+                return Err(Error::WebApiError(
+                    "Spotify devolvio una pagina inconsistente. Actualiza la vista.".into(),
+                ));
             }
+            let next = page
+                .offset
+                .checked_add(page.limit)
+                .ok_or_else(|| Error::WebApiError("Invalid page offset".into()))?;
+            let finished = page.items.is_empty() || next >= page.total;
+            func(page)?;
+            if finished {
+                break;
+            }
+            offset = next;
         }
+        Ok(())
     }
 
     /// Very similar to `for_all_pages`, but only returns a certain number of results
@@ -585,6 +1415,7 @@ impl WebApi {
                     match item.content.data.typename {
                         DataTypename::Playlist => {
                             playlist.push_back(Playlist {
+                                snapshot_id: None,
                                 id: id.into(),
                                 name: Arc::from(item.content.data.name.clone().unwrap()),
                                 images: Some(item.content.data.images.as_ref().map_or_else(
@@ -1351,6 +2182,8 @@ impl WebApi {
         #[serde(rename_all = "camelCase")]
         pub struct Lyrics {
             pub lines: Vector<TrackLines>,
+            #[serde(default)]
+            pub sync_type: String,
             pub provider: String,
             pub provider_lyrics_id: String,
         }
@@ -1367,7 +2200,18 @@ impl WebApi {
         .header("app-platform", "WebPlayer");
 
         let lyrics: Cached<Root> = self.load_cached(request, "lyrics", &track_id)?;
-        Ok(lyrics.data.lyrics.lines)
+        let mut lines = lyrics.data.lyrics.lines;
+        if lyrics.data.lyrics.sync_type != "LINE_SYNCED" {
+            for line in lines.iter_mut() {
+                line.start_time_ms = "-1".into();
+            }
+        }
+        if lines.is_empty() {
+            return Err(Error::WebApiError(
+                "Spotify no tiene letra para esta canción.".into(),
+            ));
+        }
+        Ok(lines)
     }
 }
 
@@ -1392,16 +2236,18 @@ impl WebApi {
 
     // https://developer.spotify.com/documentation/web-api/reference/save-to-library/
     pub fn save_album(&self, id: &str) -> Result<(), Error> {
-        let request = &RequestBuilder::new("v1/me/library", Method::Put, None)
-            .set_body(Some(json!({"uris": [format!("spotify:album:{id}")]})));
-        self.send_empty_json(request)
+        self.send_empty_json(&RequestBuilder::library_item("album", id, Method::Put))?;
+        self.invalidate_pages(
+            &RequestBuilder::new("v1/me/albums", Method::Get, None).query("market", "from_token"),
+        )
     }
 
     // https://developer.spotify.com/documentation/web-api/reference/remove-from-library/
     pub fn unsave_album(&self, id: &str) -> Result<(), Error> {
-        let request = &RequestBuilder::new("v1/me/library", Method::Delete, None)
-            .set_body(Some(json!({"uris": [format!("spotify:album:{id}")]})));
-        self.send_empty_json(request)
+        self.send_empty_json(&RequestBuilder::library_item("album", id, Method::Delete))?;
+        self.invalidate_pages(
+            &RequestBuilder::new("v1/me/albums", Method::Get, None).query("market", "from_token"),
+        )
     }
 
     // https://developer.spotify.com/documentation/web-api/reference/get-users-saved-tracks/
@@ -1438,30 +2284,30 @@ impl WebApi {
 
     // https://developer.spotify.com/documentation/web-api/reference/save-to-library/
     pub fn save_track(&self, id: &str) -> Result<(), Error> {
-        // Spotify's /v1/me/tracks takes the base62 ids as a query param, not a
-        // uris body.
-        let request = &RequestBuilder::new("v1/me/tracks", Method::Put, None).query("ids", id);
-        self.send_empty_json(request)
+        self.send_empty_json(&RequestBuilder::library_item("track", id, Method::Put))?;
+        self.invalidate_pages(
+            &RequestBuilder::new("v1/me/tracks", Method::Get, None).query("market", "from_token"),
+        )
     }
 
     // https://developer.spotify.com/documentation/web-api/reference/remove-from-library/
     pub fn unsave_track(&self, id: &str) -> Result<(), Error> {
-        let request = &RequestBuilder::new("v1/me/tracks", Method::Delete, None).query("ids", id);
-        self.send_empty_json(request)
+        self.send_empty_json(&RequestBuilder::library_item("track", id, Method::Delete))?;
+        self.invalidate_pages(
+            &RequestBuilder::new("v1/me/tracks", Method::Get, None).query("market", "from_token"),
+        )
     }
 
     // https://developer.spotify.com/documentation/web-api/reference/save-to-library/
     pub fn save_show(&self, id: &str) -> Result<(), Error> {
-        let request = &RequestBuilder::new("v1/me/library", Method::Put, None)
-            .set_body(Some(json!({"uris": [format!("spotify:show:{id}")]})));
-        self.send_empty_json(request)
+        self.send_empty_json(&RequestBuilder::library_item("show", id, Method::Put))?;
+        self.invalidate_pages(&RequestBuilder::new("v1/me/shows", Method::Get, None))
     }
 
     // https://developer.spotify.com/documentation/web-api/reference/remove-from-library/
     pub fn unsave_show(&self, id: &str) -> Result<(), Error> {
-        let request = &RequestBuilder::new("v1/me/library", Method::Delete, None)
-            .set_body(Some(json!({"uris": [format!("spotify:show:{id}")]})));
-        self.send_empty_json(request)
+        self.send_empty_json(&RequestBuilder::library_item("show", id, Method::Delete))?;
+        self.invalidate_pages(&RequestBuilder::new("v1/me/shows", Method::Get, None))
     }
 }
 
@@ -1470,20 +2316,12 @@ impl WebApi {
     pub fn get_user_info(&self) -> Result<(String, String), Error> {
         #[derive(Deserialize, Clone, Data)]
         struct User {
-            region: String,
-            timezone: String,
+            country: Option<String>,
         }
-        let token = self.access_token()?;
-
-        let request = &RequestBuilder::new("json".to_string(), Method::Get, None)
-            .set_protocol("http")
-            .set_base_uri("ip-api.com")
-            .query("fields", "260")
-            .header("Authorization", format!("Bearer {token}"));
-
-        let result: Cached<User> = self.load_cached(request, "user-info", "usrinfo")?;
-
-        Ok((result.data.region, result.data.timezone))
+        let request = &RequestBuilder::new("v1/me", Method::Get, None);
+        let user: User = self.load(request)?;
+        let timezone = std::env::var("TZ").unwrap_or_else(|_| "UTC".into());
+        Ok((user.country.unwrap_or_else(|| "US".into()), timezone))
     }
 
     pub fn get_section(&self, section_uri: &str) -> Result<MixedView, Error> {
@@ -1571,15 +2409,13 @@ impl WebApi {
     }
 
     pub fn follow_playlist(&self, id: &str) -> Result<(), Error> {
-        let request = &RequestBuilder::new("v1/me/library", Method::Put, None)
-            .set_body(Some(json!({"uris": [format!("spotify:playlist:{id}")]})));
+        let request = &RequestBuilder::library_item("playlist", id, Method::Put);
         self.send_empty_json(request)?;
         Ok(())
     }
 
     pub fn unfollow_playlist(&self, id: &str) -> Result<(), Error> {
-        let request = &RequestBuilder::new("v1/me/library", Method::Delete, None)
-            .set_body(Some(json!({"uris": [format!("spotify:playlist:{id}")]})));
+        let request = &RequestBuilder::library_item("playlist", id, Method::Delete);
         self.send_empty_json(request)?;
         Ok(())
     }
@@ -1593,6 +2429,36 @@ impl WebApi {
 
     // https://developer.spotify.com/documentation/web-api/reference/get-playlist-items
     pub fn get_playlist_tracks(&self, id: &str) -> Result<Vector<Arc<Track>>, Error> {
+        // One metadata lookup can avoid fetching every page of an unchanged playlist.
+        let playlist = self.get_playlist(id)?;
+        let snapshot_key = self.response_key(&RequestBuilder::new(
+            format!("v1/playlists/{id}"),
+            Method::Get,
+            None,
+        ));
+        if let (Some(key), Some(snapshot)) = (&snapshot_key, &playlist.snapshot_id) {
+            if let Some(file) = self.cache.get("playlist-snapshots", key) {
+                if let Ok((saved, items)) =
+                    serde_json::from_reader::<_, (String, Vec<(usize, Arc<Track>)>)>(file)
+                {
+                    if saved == snapshot.as_ref() {
+                        return Ok(items
+                            .into_iter()
+                            .map(|(position, mut track)| {
+                                Arc::make_mut(&mut track).track_pos = position;
+                                track
+                            })
+                            .collect());
+                    }
+                    // A new revision must never inherit still-fresh pages of the old revision.
+                    self.invalidate_pages(
+                        &RequestBuilder::new(format!("v1/playlists/{id}/items"), Method::Get, None)
+                            .query("marker", "from_token")
+                            .query("additional_types", "track"),
+                    )?;
+                }
+            }
+        }
         #[derive(Clone, Deserialize)]
         struct PlaylistItem {
             #[serde(default)]
@@ -1619,7 +2485,7 @@ impl WebApi {
 
         let local_track_manager = self.local_track_manager.lock();
 
-        Ok(result
+        let tracks: Vector<Arc<Track>> = result
             .into_iter()
             .enumerate()
             .filter_map(|(index, item)| {
@@ -1634,14 +2500,103 @@ impl WebApi {
                 Arc::make_mut(&mut track).track_pos = index;
                 Some(track)
             })
-            .collect())
+            .collect();
+        if !tracks.iter().any(|track| track.is_local) {
+            if let (Some(key), Some(snapshot)) = (snapshot_key, playlist.snapshot_id) {
+                let items: Vec<_> = tracks
+                    .iter()
+                    .map(|track| (track.track_pos, track))
+                    .collect();
+                self.cache.set(
+                    "playlist-snapshots",
+                    &key,
+                    &serde_json::to_vec(&(snapshot, items))?,
+                );
+            }
+        }
+        Ok(tracks)
     }
 
     // https://developer.spotify.com/documentation/web-api/reference/change-playlist-details
+    pub fn create_private_playlist(&self, name: &str) -> Result<String, Error> {
+        #[derive(Deserialize)]
+        struct Created {
+            id: String,
+        }
+        let request = &RequestBuilder::new(
+            "v1/me/playlists",
+            Method::Post,
+            Some(
+                json!({"name": name, "public": false, "description": "Created by Splitify Native."}),
+            ),
+        );
+        let created: Created = self.load(request)?;
+        Ok(created.id)
+    }
+
+    pub fn add_tracks_to_playlist(&self, id: &str, uris: &[String]) -> Result<(), Error> {
+        if uris.len() > 100 {
+            return Err(Error::WebApiError(
+                "Spotify accepts at most 100 tracks per request".into(),
+            ));
+        }
+        let request = &RequestBuilder::new(
+            format!("v1/playlists/{id}/items"),
+            Method::Post,
+            Some(json!({"uris": uris})),
+        );
+        self.request(request).map(|_| ())
+    }
+
     pub fn change_playlist_details(&self, id: &str, name: &str) -> Result<(), Error> {
         let request = &RequestBuilder::new(format!("v1/playlists/{id}"), Method::Put, None)
             .set_body(Some(json!({ "name": name })));
         self.send_empty_json(request)?;
+        Ok(())
+    }
+
+    pub fn reorder_playlist_track(
+        &self,
+        movement: &crate::data::PlaylistReorder,
+    ) -> Result<(), Error> {
+        let id = &movement.link.id;
+        // Read live state, bypassing cache, and verify the original occurrence before writing.
+        let mut response = self.request(&RequestBuilder::new(
+            format!("v1/playlists/{id}"),
+            Method::Get,
+            None,
+        ))?;
+        let metadata: serde_json::Value = response.body_mut().read_json()?;
+        let snapshot = metadata
+            .get("snapshot_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                Error::WebApiError("Spotify no devolvió la versión de la playlist.".into())
+            })?;
+        let mut response = self.request(
+            &RequestBuilder::new(format!("v1/playlists/{id}/items"), Method::Get, None)
+                .query("offset", movement.position.to_string())
+                .query("limit", "1"),
+        )?;
+        let page: serde_json::Value = response.body_mut().read_json()?;
+        let track = page
+            .pointer("/items/0/item/id")
+            .or_else(|| page.pointer("/items/0/track/id"))
+            .and_then(|v| v.as_str());
+        let expected = movement.track_id.0.to_base62();
+        if track != Some(expected.as_str()) {
+            return Err(Error::WebApiError(
+                "La playlist cambió. Actualízala antes de reordenar.".into(),
+            ));
+        }
+        let total = page.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let insert_before = reorder_destination(movement.position, total, movement.down)?;
+        self.request(&RequestBuilder::new(
+            format!("v1/playlists/{id}/items"),
+            Method::Put,
+            Some(json!({"range_start": movement.position, "range_length": 1,
+                "insert_before": insert_before, "snapshot_id": snapshot})),
+        ))?;
         Ok(())
     }
 
@@ -1823,26 +2778,34 @@ impl WebApi {
             return Ok(disk_cached_image);
         }
 
-        // Split the URI into its components
-        let uri_clone = uri.clone();
-        let parsed = url::Url::parse(&uri_clone).unwrap();
-
-        let protocol = parsed.scheme();
-        let base_uri = parsed.host_str().unwrap();
-        let path = parsed.path().trim_start_matches('/');
-
-        let mut queries = std::collections::HashMap::new();
-        for (k, v) in parsed.query_pairs() {
-            queries.insert(k.to_string(), v.to_string());
+        let parsed =
+            url::Url::parse(&uri).map_err(|_| Error::WebApiError("Invalid image URL".into()))?;
+        let host = parsed.host_str().unwrap_or("");
+        let allowed = [
+            "scdn.co",
+            "spotifycdn.com",
+            "spotify.com",
+            "lastfm.freetls.fastly.net",
+            "lastfm-img2.akamaized.net",
+        ]
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")));
+        if parsed.scheme() != "https" || !allowed {
+            return Err(Error::WebApiError("Untrusted image source".into()));
         }
-
-        let request = RequestBuilder::new(path, Method::Get, None)
-            .set_protocol(protocol)
-            .set_base_uri(base_uri);
-
-        let response = self.request(&request)?;
+        // Image CDNs never receive Spotify authorization or client-token headers.
+        let response =
+            psst_core::util::retry_network_read(|| self.agent.get(parsed.as_str()).call())
+                .map_err(|e| Error::WebApiError(e.to_string()))?;
         let mut body = Vec::new();
-        response.into_body().into_reader().read_to_end(&mut body)?;
+        response
+            .into_body()
+            .into_reader()
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut body)?;
+        if body.len() > 16 * 1024 * 1024 {
+            return Err(Error::WebApiError("Image exceeds size limit".into()));
+        }
 
         let format = match infer::get(body.as_slice()) {
             Some(kind) if kind.mime_type() == "image/jpeg" => Some(ImageFormat::Jpeg),
@@ -1913,6 +2876,11 @@ struct RequestBuilder {
 }
 
 impl RequestBuilder {
+    fn library_item(kind: &str, id: &str, method: Method) -> Self {
+        let uri = format!("spotify:{kind}:{id}");
+        Self::new("v1/me/library", method, None).query("uris", urlencoding::encode(&uri))
+    }
+
     // By default, we use https and the api.spotify.com
     fn new(path: impl Display, method: Method, body: Option<serde_json::Value>) -> Self {
         Self {
@@ -1944,10 +2912,6 @@ impl RequestBuilder {
         self
     }
 
-    fn set_protocol(mut self, protocol: impl Display) -> Self {
-        self.protocol = protocol.to_string();
-        self
-    }
     fn get_headers(&self) -> &HashMap<String, String> {
         &self.headers
     }
@@ -1978,11 +2942,155 @@ impl RequestBuilder {
                 &self
                     .queries
                     .iter()
+                    .sorted_by_key(|(key, _)| *key)
                     .map(|(k, v)| format!("{k}={v}"))
                     .collect::<Vec<_>>()
                     .join("&"),
             );
         }
         url
+    }
+}
+
+fn reorder_destination(position: usize, total: usize, down: bool) -> Result<usize, Error> {
+    if position >= total || (down && position + 1 >= total) || (!down && position == 0) {
+        return Err(Error::WebApiError(
+            "La cancion ya esta en el extremo de la playlist.".into(),
+        ));
+    }
+    Ok(if down { position + 2 } else { position - 1 })
+}
+
+#[cfg(test)]
+mod reorder_tests {
+    use super::reorder_destination;
+    #[test]
+    fn spotify_insertion_indices_preserve_adjacent_order() {
+        assert_eq!(reorder_destination(3, 8, true).unwrap(), 5);
+        assert_eq!(reorder_destination(3, 8, false).unwrap(), 2);
+        assert!(reorder_destination(0, 8, false).is_err());
+        assert!(reorder_destination(7, 8, true).is_err());
+        assert!(reorder_destination(8, 8, false).is_err());
+        assert!(reorder_destination(0, 0, true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod efficiency_tests {
+    use super::*;
+    fn api() -> WebApi {
+        let path = std::env::temp_dir().join(format!(
+            "xpotify-efficiency-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let api = WebApi::new(Some("http://127.0.0.1:9"), Some(path), 5000);
+        api.set_webapi_credentials(
+            Some("fixture-client".into()),
+            Some(WebApiToken {
+                access_token: "fixture-access".into(),
+                refresh_token: Some("fixture-refresh".into()),
+                expires_at: u64::MAX,
+            }),
+        );
+        let request = RequestBuilder::new("v1/me", Method::Get, None);
+        let until = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        api.cache.set(
+            "request-limits",
+            &api.rate_limit_key(&request),
+            &serde_json::to_vec(&until).unwrap(),
+        );
+        api
+    }
+    #[test]
+    fn library_backup_survives_refresh_and_never_crosses_accounts() {
+        let api = api();
+        let request = RequestBuilder::new("v1/me", Method::Get, None);
+        let key = api.response_key(&request).unwrap();
+        api.cache.set(
+            "library-snapshots",
+            &key,
+            br#"{"display_name":"Fixture","id":"fixture-user"}"#,
+        );
+        api.cache.invalidate_metadata().unwrap();
+        assert_eq!(api.get_user_profile().unwrap().id.as_ref(), "fixture-user");
+        api.set_webapi_credentials(
+            Some("fixture-client".into()),
+            Some(WebApiToken {
+                access_token: "another-access".into(),
+                refresh_token: Some("another-refresh".into()),
+                expires_at: u64::MAX,
+            }),
+        );
+        assert!(matches!(
+            api.get_user_profile(),
+            Err(Error::RateLimited { .. })
+        ));
+    }
+    #[test]
+    fn unchanged_playlist_reuses_snapshot_and_changed_revision_rejects_old_pages() {
+        let api = api();
+        let id = "37i9dQZF1DX4WYpdgoIcn6";
+        let request = RequestBuilder::new(format!("v1/playlists/{id}"), Method::Get, None);
+        let key = api.response_key(&request).unwrap();
+        let mut metadata = json!({"id":id,"name":"Fixture","description":"", "owner":{"id":"fixture-user","display_name":"Fixture"},"collaborative":false,"public":false,"snapshot_id":"revision-a"});
+        api.cache
+            .set("responses", &key, &serde_json::to_vec(&metadata).unwrap());
+        let track: Track = serde_json::from_value(json!({
+            "id":"7omij53d6AvXefx13NNyfn", "name":"Fixture song", "artists":[], "duration_ms":180000,
+            "disc_number":1,"track_number":1,"explicit":false,"is_local":false
+        })).unwrap();
+        let items = vec![(0usize, &track), (3usize, &track)];
+        api.cache.set(
+            "playlist-snapshots",
+            &key,
+            &serde_json::to_vec(&("revision-a", items)).unwrap(),
+        );
+        let tracks = api.get_playlist_tracks(id).unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[1].track_pos, 3);
+        assert_eq!(tracks[0].id, tracks[1].id);
+        let page = RequestBuilder::new(format!("v1/playlists/{id}/items"), Method::Get, None)
+            .query("marker", "from_token")
+            .query("additional_types", "track")
+            .query("limit", 50)
+            .query("offset", 0);
+        let page_key = api.response_key(&page).unwrap();
+        api.cache.set(
+            "responses",
+            &page_key,
+            br#"{"offset":0,"limit":50,"total":0,"items":[]}"#,
+        );
+        metadata["snapshot_id"] = json!("revision-b");
+        api.cache
+            .set("responses", &key, &serde_json::to_vec(&metadata).unwrap());
+        assert!(matches!(
+            api.get_playlist_tracks(id),
+            Err(Error::RateLimited { .. })
+        ));
+        assert!(api.cache.get("responses", &page_key).is_none());
+    }
+    #[test]
+    fn repeated_transient_read_returns_same_error_without_network() {
+        let api = api();
+        let request = RequestBuilder::new("v1/me/tracks", Method::Get, None);
+        api.read_failures.lock().insert(
+            request.build(),
+            (Instant::now(), Error::WebApiError("fixture timeout".into())),
+        );
+        let first = api
+            .load::<serde_json::Value>(&request)
+            .unwrap_err()
+            .to_string();
+        let second = api
+            .load::<serde_json::Value>(&request)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(first, second);
+        assert!(first.contains("fixture timeout"));
     }
 }

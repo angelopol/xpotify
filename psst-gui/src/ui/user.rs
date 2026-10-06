@@ -17,7 +17,7 @@ pub const LOAD_PROFILE: Selector = Selector::new("app.user.load-profile");
 pub fn user_widget() -> impl Widget<AppState> {
     let is_connected = Either::new(
         // TODO: Avoid the locking here.
-        |state: &AppState, _| state.session.is_connected(),
+        |state: &AppState, _| state.connect.native_ready || state.session.is_connected(),
         Label::new("Connected")
             .with_text_color(theme::PLACEHOLDER_COLOR)
             .with_text_size(theme::TEXT_SIZE_SMALL),
@@ -60,4 +60,5 @@ fn preferences_widget<T: Data>(svg: &SvgIcon) -> impl Widget<T> {
         .link()
         .rounded(theme::BUTTON_BORDER_RADIUS)
         .on_left_click(|ctx, _, _, _| ctx.submit_command(commands::SHOW_PREFERENCES))
+        .tooltip("Abrir ajustes")
 }

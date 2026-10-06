@@ -3,8 +3,8 @@ use std::{cell::RefCell, cmp::Ordering, rc::Rc, sync::Arc};
 use druid::{
     im::Vector,
     widget::{Button, Either, Flex, Label, LensWrap, LineBreaking, List, TextBox},
-    Insets, Lens, LensExt, LocalizedString, Menu, MenuItem, Selector, Size, UnitPoint, Widget,
-    WidgetExt, WindowDesc,
+    Lens, LensExt, LocalizedString, Menu, MenuItem, Selector, Size, UnitPoint, Widget, WidgetExt,
+    WindowDesc,
 };
 use itertools::Itertools;
 
@@ -12,7 +12,7 @@ use crate::{
     cmd,
     data::{
         config::{SortCriteria, SortOrder},
-        AppState, Ctx, Library, Nav, Playlist, PlaylistAddTrack, PlaylistDetail, PlaylistLink,
+        AppState, Ctx, Nav, Playlist, PlaylistAddTrack, PlaylistDetail, PlaylistLink,
         PlaylistRemoveTrack, PlaylistTracks, Track, WithCtx,
     },
     error::Error,
@@ -23,11 +23,62 @@ use crate::{
 
 use super::{playable, theme, track, utils};
 
+pub fn picker_cover() -> impl Widget<Playlist> {
+    RemoteImage::new(
+        crate::widget::icons::PLAYLIST
+            .scale((24.0, 24.0))
+            .with_color(theme::PLACEHOLDER_COLOR)
+            .center()
+            .background(theme::GREY_700),
+        |playlist: &Playlist, _| playlist.image(48.0, 48.0).map(|image| image.url.clone()),
+    )
+}
+
+fn library_row_widget() -> impl Widget<WithCtx<Playlist>> {
+    let cover = picker_cover()
+        .lens(Ctx::data())
+        .fix_size(48.0, 48.0)
+        .clip(Size::new(48.0, 48.0).to_rounded_rect(5.0));
+    let labels = Flex::column()
+        .cross_axis_alignment(druid::widget::CrossAxisAlignment::Start)
+        .with_child(
+            Label::raw()
+                .with_font(theme::UI_FONT_MEDIUM)
+                .with_line_break_mode(LineBreaking::Clip)
+                .lens(Ctx::data().then(Playlist::name))
+                .expand_width(),
+        )
+        .with_spacer(5.0)
+        .with_child(
+            Label::dynamic(|row: &WithCtx<Playlist>, _| {
+                format!(
+                    "Playlist · {}",
+                    if row.data.owner.display_name.is_empty() {
+                        &row.data.owner.id
+                    } else {
+                        &row.data.owner.display_name
+                    }
+                )
+            })
+            .with_text_size(theme::TEXT_SIZE_SMALL)
+            .with_text_color(theme::PLACEHOLDER_COLOR)
+            .with_line_break_mode(LineBreaking::Clip)
+            .expand_width(),
+        );
+    Flex::row().with_child(cover).with_spacer(12.0).with_flex_child(labels, 1.0)
+        .padding((10.0, 8.0)).expand_width().link().rounded(6.0)
+        .active(|row: &WithCtx<Playlist>, _| matches!(&row.ctx.nav, Nav::PlaylistDetail(link) if link.id == row.data.id))
+        .on_left_click(|ctx, _, row, _| ctx.submit_command(cmd::NAVIGATE.with(Nav::PlaylistDetail(row.data.link()))))
+        .context_menu(playlist_menu_ctx)
+}
+
 pub const LOAD_LIST: Selector = Selector::new("app.playlist.load-list");
 pub const LOAD_DETAIL: Selector<(PlaylistLink, AppState)> =
     Selector::new("app.playlist.load-detail");
 pub const ADD_TRACK: Selector<PlaylistAddTrack> = Selector::new("app.playlist.add-track");
 pub const REMOVE_TRACK: Selector<PlaylistRemoveTrack> = Selector::new("app.playlist.remove-track");
+pub const REORDER_TRACK: Selector<crate::data::PlaylistReorder> =
+    Selector::new("app.playlist.reorder-track");
 
 pub const FOLLOW_PLAYLIST: Selector<Playlist> = Selector::new("app.playlist.follow");
 pub const UNFOLLOW_PLAYLIST: Selector<PlaylistLink> = Selector::new("app.playlist.unfollow");
@@ -46,31 +97,12 @@ const SHOW_UNFOLLOW_PLAYLIST_CONFIRM: Selector<UnfollowPlaylist> =
 pub fn list_widget() -> impl Widget<AppState> {
     Async::new(
         utils::spinner_widget,
-        || {
-            List::new(|| {
-                Label::raw()
-                    .with_line_break_mode(LineBreaking::WordWrap)
-                    .with_text_size(theme::TEXT_SIZE_SMALL)
-                    .lens(Ctx::data().then(Playlist::name))
-                    .expand_width()
-                    .padding(Insets::uniform_xy(theme::grid(2.0), theme::grid(0.6)))
-                    .link()
-                    .on_left_click(|ctx, _, playlist, _| {
-                        ctx.submit_command(
-                            cmd::NAVIGATE.with(Nav::PlaylistDetail(playlist.data.link())),
-                        );
-                    })
-                    .context_menu(playlist_menu_ctx)
-            })
-        },
+        || List::new(library_row_widget),
         utils::error_widget,
     )
     .lens(
-        Ctx::make(
-            AppState::common_ctx,
-            AppState::library.then(Library::playlists.in_arc()),
-        )
-        .then(Ctx::in_promise()),
+        druid::lens::Map::new(super::folders::filtered_playlists, |_, _| {})
+            .then(Ctx::in_promise()),
     )
     .on_command_async(
         LOAD_LIST,
@@ -89,25 +121,28 @@ pub fn list_widget() -> impl Widget<AppState> {
                     .ok_or_else(|| Error::WebApiError("Item doesn't have URI".to_string()))?,
             )
         },
-        |_, data, d| {
-            data.with_library_mut(|library| library.increment_playlist_track_count(&d.link))
-        },
-        |_, data, (_, r)| {
+        |_, _, _| {},
+        |ctx, data, (d, r)| {
             if let Err(err) = r {
                 data.error_alert(err);
             } else {
+                data.with_library_mut(|library| library.increment_playlist_track_count(&d.link));
                 data.info_alert("Added to playlist.");
+                if matches!(&data.nav, Nav::PlaylistDetail(link) if link.id == d.link.id) {
+                    ctx.submit_command(cmd::NAVIGATE_REFRESH);
+                }
             }
         },
     )
     .on_command_async(
         UNFOLLOW_PLAYLIST,
         |link| WebApi::global().unfollow_playlist(link.id.as_ref()),
-        |_, data: &mut AppState, d| data.with_library_mut(|l| l.remove_from_playlist(&d.id)),
-        |_, data, (_, r)| {
+        |_, _, _| {},
+        |_, data, (d, r)| {
             if let Err(err) = r {
                 data.error_alert(err);
             } else {
+                data.with_library_mut(|l| l.remove_from_playlist(&d.id));
                 data.info_alert("Playlist removed from library.");
             }
         },
@@ -115,11 +150,12 @@ pub fn list_widget() -> impl Widget<AppState> {
     .on_command_async(
         FOLLOW_PLAYLIST,
         |link| WebApi::global().follow_playlist(link.id.as_ref()),
-        |_, data: &mut AppState, d| data.with_library_mut(|l| l.add_playlist(d)),
-        |_, data: &mut AppState, (_, r)| {
+        |_, _, _| {},
+        |_, data: &mut AppState, (d, r)| {
             if let Err(err) = r {
                 data.error_alert(err);
             } else {
+                data.with_library_mut(|l| l.add_playlist(d));
                 data.info_alert("Playlist added to library.")
             }
         },
@@ -127,12 +163,18 @@ pub fn list_widget() -> impl Widget<AppState> {
     .on_command_async(
         RENAME_PLAYLIST,
         |link| WebApi::global().change_playlist_details(link.id.as_ref(), link.name.as_ref()),
-        |_, data: &mut AppState, link| data.with_library_mut(|l| l.rename_playlist(link)),
-        |_, data: &mut AppState, (_, r)| {
+        |_, _, _| {},
+        |ctx, data: &mut AppState, (link, r)| {
             if let Err(err) = r {
                 data.error_alert(err);
             } else {
-                data.info_alert("Playlist renamed.")
+                let current =
+                    matches!(&data.nav, Nav::PlaylistDetail(current) if current.id == link.id);
+                data.with_library_mut(|l| l.rename_playlist(link));
+                data.info_alert("Playlist renamed.");
+                if current {
+                    ctx.submit_command(cmd::NAVIGATE_REFRESH);
+                }
             }
         },
     )
@@ -147,17 +189,28 @@ pub fn list_widget() -> impl Widget<AppState> {
     .on_command_async(
         REMOVE_TRACK,
         |d| WebApi::global().remove_track_from_playlist(&d.link.id, &d.track_uri),
-        |_, data, d| {
-            data.with_library_mut(|library| library.decrement_playlist_track_count(&d.link))
-        },
+        |_, _, _| {},
         |e, data, (p, r)| {
             if let Err(err) = r {
                 data.error_alert(err);
             } else {
+                data.with_library_mut(|library| library.decrement_playlist_track_count(&p.link));
                 data.info_alert("Removed from playlist.");
             }
             // Re-submit the `LOAD_DETAIL` command to reload the playlist data.
             e.submit_command(LOAD_DETAIL.with((p.link, data.clone())))
+        },
+    )
+    .on_command_async(
+        REORDER_TRACK,
+        |move_track| WebApi::global().reorder_playlist_track(&move_track),
+        |_, _, _| {},
+        |ctx, data, (_, result)| match result {
+            Ok(()) => {
+                data.info_alert("Orden de la playlist actualizado.");
+                ctx.submit_command(cmd::NAVIGATE_REFRESH);
+            }
+            Err(error) => data.error_alert(error),
         },
     )
 }
@@ -412,20 +465,24 @@ pub fn detail_widget() -> impl Widget<AppState> {
 }
 
 fn async_playlist_info_widget() -> impl Widget<AppState> {
-    Async::new(utils::spinner_widget, playlist_info_widget, || Empty)
-        .lens(
-            Ctx::make(
-                AppState::common_ctx,
-                AppState::playlist_detail.then(PlaylistDetail::playlist),
-            )
-            .then(Ctx::in_promise()),
+    Async::new(
+        utils::spinner_widget,
+        playlist_info_widget,
+        utils::error_widget,
+    )
+    .lens(
+        Ctx::make(
+            AppState::common_ctx,
+            AppState::playlist_detail.then(PlaylistDetail::playlist),
         )
-        .on_command_async(
-            LOAD_DETAIL,
-            |d| WebApi::global().get_playlist(&d.0.id),
-            |_, data, d| data.playlist_detail.playlist.defer(d.0),
-            |_, data, (d, r)| data.playlist_detail.playlist.update((d.0, r)),
-        )
+        .then(Ctx::in_promise()),
+    )
+    .on_command_async(
+        LOAD_DETAIL,
+        |d| WebApi::global().get_playlist(&d.0.id),
+        |_, data, d| data.playlist_detail.playlist.defer(d.0),
+        |_, data, (d, r)| data.playlist_detail.playlist.update((d.0, r)),
+    )
 }
 
 fn playlist_info_widget() -> impl Widget<WithCtx<Playlist>> {
@@ -514,12 +571,12 @@ fn async_tracks_widget() -> impl Widget<AppState> {
             },
             |_, data, d| data.playlist_detail.tracks.defer(d.0),
             |_, data, (d, r)| {
-                let tracks = PlaylistTracks {
+                let tracks = r.map(|tracks| PlaylistTracks {
                     id: d.0.id.clone(),
                     name: d.0.name.clone(),
-                    tracks: r,
-                };
-                data.playlist_detail.tracks.update((d.0, Ok(tracks)))
+                    tracks,
+                });
+                data.playlist_detail.tracks.update((d.0, tracks))
             },
         )
 }
@@ -539,11 +596,14 @@ fn tracks_widget() -> impl Widget<WithCtx<PlaylistTracks>> {
     )
 }
 
-fn sort_playlist(data: &AppState, result: Result<Vector<Arc<Track>>, Error>) -> Vector<Arc<Track>> {
+fn sort_playlist(
+    data: &AppState,
+    result: Result<Vector<Arc<Track>>, Error>,
+) -> Result<Vector<Arc<Track>>, Error> {
     let sort_criteria = data.config.sort_criteria;
     let sort_order = data.config.sort_order;
 
-    let playlist = result.unwrap_or_else(|_| Vector::new());
+    let playlist = result?;
 
     let sorted_playlist: Vector<Arc<Track>> = playlist
         .into_iter()
@@ -565,9 +625,9 @@ fn sort_playlist(data: &AppState, result: Result<Vector<Arc<Track>>, Error>) -> 
         .collect();
 
     if sort_criteria == SortCriteria::DateAdded && sort_order == SortOrder::Descending {
-        sorted_playlist.into_iter().rev().collect()
+        Ok(sorted_playlist.into_iter().rev().collect())
     } else {
-        sorted_playlist
+        Ok(sorted_playlist)
     }
 }
 
@@ -575,7 +635,15 @@ fn playlist_menu_ctx(playlist: &WithCtx<Playlist>) -> Menu<AppState> {
     let library = &playlist.ctx.library;
     let playlist = &playlist.data;
 
-    let mut menu = Menu::empty();
+    let mut menu = Menu::empty().entry(
+        MenuItem::new("Organizar en carpeta...")
+            .command(super::folders::ASSIGN_WINDOW.with(playlist.link())),
+    );
+
+    menu = menu.entry(
+        MenuItem::new("Dividir con Splitify IA")
+            .command(crate::splitify::OPEN.with(playlist.id.to_string())),
+    );
 
     menu = menu.entry(
         MenuItem::new(

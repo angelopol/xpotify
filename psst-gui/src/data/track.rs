@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::{AlbumLink, ArtistLink};
 
-#[derive(Clone, Debug, Data, Lens, Deserialize)]
+#[derive(Clone, Debug, Data, Lens, Deserialize, Serialize)]
 pub struct Track {
     #[serde(default)]
     pub id: TrackId,
@@ -16,6 +16,7 @@ pub struct Track {
     pub artists: Vector<ArtistLink>,
     #[serde(rename = "duration_ms")]
     #[serde(deserialize_with = "super::utils::deserialize_millis")]
+    #[serde(serialize_with = "super::utils::serialize_millis")]
     pub duration: Duration,
     pub disc_number: usize,
     pub track_number: usize,
@@ -82,6 +83,12 @@ pub struct TrackLines {
     pub start_time_ms: String,
     pub words: String,
     pub end_time_ms: String,
+}
+
+#[derive(Clone, Debug, Data, Lens)]
+pub struct Lyrics {
+    pub lines: druid::im::Vector<TrackLines>,
+    pub notice: String,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Hash, Deserialize, Serialize)]

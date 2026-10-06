@@ -5,6 +5,12 @@ cache
 .idea
 .DS_Store
 .env
+.env.local
+.tools/
+dist/
+/Xpotify.lnk
+.logs/
 *.iml
 rust-toolchain
 *.ico
+Xpotify.exe
