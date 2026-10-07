@@ -6,6 +6,18 @@ Cliente nativo basado en Psst, con organización de playlists mediante Gemini, l
 
 ## Integración local con Splitify
 
+En **0.4.5**, la biblioteca se abre como una barra compacta de portadas, con tooltips y un botón para expandirla. La app recuerda esa elección. Las filas horizontales reservan espacio para el scroll y Connect conserva la última selección mientras se conecta.
+
+En **0.4.4**, la cola muestra páginas de 50 canciones, con botones para avanzar y volver tanto en el panel del reproductor como en la vista completa. Cambiar de página no consulta la API de Spotify.
+
+En **0.4.3**, la sombra llega hasta el volumen y la línea de progreso mide 2 píxeles, conservando un área de clic cómoda.
+
+En **0.4.2**, el reproductor incorpora una sombra de bloques verdes que responde al audio local y se desvanece al pausar.
+
+En **0.4.1** se amplía el margen del scroll, Letras/Cola/Videoclip comparten una fila y las playlists tienen un botón de reproducción visible al desplazarse. El enlace Source de la aplicación apunta a este repositorio.
+
+La versión **0.4.0** adapta mejoras de Spotifast: cola del motor con orden aleatorio real, filas virtualizadas para listas largas, colores y separadores compactos, consultas HTTP acotadas y caché por petición. Consulta [qué se incorporó y sus límites](SPOTIFAST-INTEGRATION.md).
+
 Esta versión añade un editor nativo de playlists con `gemini-3.5-flash-lite`. Pulsa **Organizar con IA** o haz clic derecho en una playlist y elige **Dividir con Splitify IA**. Configura `GEMINI_API_KEY` y `SPOTIFY_CLIENT_ID` en `.env.local`; añade `http://127.0.0.1:8888/login` como redirect URI en Spotify Developer Dashboard. La autorización de reproducción nativa utiliza por separado `http://127.0.0.1:8898/login`. La IA propone una vista previa editable y el botón de creación genera playlists privadas. La reproducción sigue usando el cliente nativo.
 
 Consulta [la revisión de seguridad](SECURITY-REVIEW.md): se corrigieron fugas de tokens en el código heredado y se actualizaron dependencias. La rama `main` del repositorio Splitify conserva la aplicación web; la integración nativa vive en este repositorio xpotify, rama `splitify-integration`. Ejecuta `Start-Xpotify.cmd`; consulta [uso y configuración](SPLITIFY.md).
@@ -196,3 +208,11 @@ This project would not exist without the following:
 - [`druid`](https://github.com/linebender/druid) native GUI library for Rust.
 - [`ncspot`](https://github.com/hrkfdn/ncspot) cross-platform ncurses Spotify client written in Rust, using `librespot`.
 - ...and of course other libraries and projects.
+
+
+### Diagnostico e inicio en Windows
+
+- **Ajustes > Logs** muestra errores, advertencias y eventos importantes, se actualiza cada dos segundos y permite exportar el historial a un `.log`. Se conservan tres archivos de aproximadamente 2 MB en la carpeta de configuracion de Psst, subcarpeta `logs`; la vista muestra los ultimos 64 KB. Los secretos reconocidos y las URLs se ocultan antes de guardar.
+- La calidad de audio elegida se aplica a las siguientes cargas; la cancion actual continua sin reiniciar el receptor. Se descarta cualquier precarga hecha con la calidad anterior.
+- **Ajustes > General > Windows** permite iniciar con Windows y abrir en la bandeja. Un doble clic en el icono recupera la ventana. El inicio automatico usa `--autostart`; abrir la app normalmente sigue mostrando la ventana.
+- El atajo global opcional **Ctrl + Alt + P** funciona mientras Xpotify esta abierto, incluso en la bandeja. Puede reanudar la ultima cancion desde su posicion guardada o reproducir la siguiente de la cola. Si no hay siguiente cancion o el atajo esta ocupado, la app muestra un aviso.

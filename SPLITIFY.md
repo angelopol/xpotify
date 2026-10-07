@@ -1,8 +1,24 @@
 # Xpotify with Splitify
 
-## Windows 0.2.0
+## Windows 0.4.5
 
-Download the optimized Windows x64 executable or portable ZIP from [GitHub Releases](https://github.com/angelopol/xpotify/releases/latest). The package includes the launcher, documentation, both licenses and SHA-256 verification. Build locally with `powershell -File scripts/Build-Native.ps1 -Release`; `Package-Native.ps1` now uses the release build by default. The release executable excludes development preview modes.
+The library defaults to a 72 px compact rail with playlist artwork, navigation icons, tooltips and Preferences. Its top library button expands the full 260 px sidebar; the same button collapses it. This preference persists across restarts. Both views retain playlist context menus, active navigation and the same cached playlist/profile data; their request handlers stay mounted while switching modes. Playlist folders remain available in the expanded view.
+
+Home carousels use one horizontal scroll per section and reserve 16 px below their cards. Card labels have an 80 px clipped area so long descriptions cannot paint over the scrollbar or following section. The source icon beside the current track opens its album/playlist page, with an explicit tooltip and left-click navigation.
+
+If local Connect is still registering or its command channel is full, Xpotify retains the latest validated playback selection and sends it once the receiver is ready. Pause/resume changes that pending intent; Stop, switching to a remote device, disabling Connect or closing the app cancels it. An explicit selection may trigger reconnection, while automatic network failures retain the existing retry backoff. A closed command channel is distinguished from a full one. Startup still restores in pause and does not activate this PC without a playback request.
+
+Both the current-playback panel and full queue show 50 upcoming songs per page. Use **‹ 50** / **50 ›** to move backward or forward; the range label shows the current entries and total. Scroll within each page to see all its rows. The final page contains the remaining songs, and unavailable navigation buttons are disabled. Pagination keeps absolute queue positions, including duplicate tracks, and returns to the top of the queue rows when changing pages. Only visible rows create widgets and request artwork; paging makes no additional Spotify Web API calls. Native Connect currently supplies an 80-track upcoming window, so its second page can contain 30 songs; this UI does not infer additional songs from the unshuffled playlist or change the engine's wire limit.
+
+The audio shadow spans the complete footer, including volume, with mirrored bands that bring bass pulses to both ends. The seek line is now 2 px tall while retaining its 8 px mouse target.
+
+The playback footer in 0.4.2 has a subtle green square-cell audio shadow driven by eight local PCM bands. It fades out on pause, silence, mute or stale output. The animation uses a local 30 Hz timer and never requests Spotify audio analysis or updates queue data. Remote devices do not expose their PCM to this PC.
+
+Playlist pages now have a persistent **Reproducir playlist** button, which starts all loaded tracks from the beginning using the current playback mode. It is disabled while tracks are unavailable. Scrollable library views reserve a wider right gutter, and the playback panel places **Letras**, **Cola** and **Videoclip** in one row. Preferences → About → Source points to `https://github.com/angelopol/xpotify`.
+
+This update adapts Spotifast's compact colors and divider spacing. The native Connect queue observes actual engine shuffle/advancement directly, without Web API polling. Selecting an active queue row retains its context and remaining order. Large queue panels render only visible rows; equivalent cached reads share a per-key lock, while at most two HTTP responses are in flight. Transient JSON reads share a three-attempt budget. See `SPOTIFAST-INTEGRATION.md` in the source repository for details and limits.
+
+Download the optimized Windows x64 executable or portable ZIP from [GitHub Releases](https://github.com/angelopol/xpotify/releases/latest). The package includes the launcher, documentation, the Psst, librespot and Spotifast licenses and SHA-256 verification. Build locally with `powershell -File scripts/Build-Native.ps1 -Release`; `Package-Native.ps1` now uses the release build by default. The release executable excludes development preview modes.
 
 Windows taskbar thumbnails include **Anterior**, **Reproducir/Pausar** and **Siguiente**, including while the main window is minimized. The middle icon follows playback state. Controls are disabled when playback is unavailable, and reinstalled when Explorer recreates the taskbar.
 

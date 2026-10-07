@@ -2,6 +2,7 @@ mod download;
 mod folders;
 mod grid;
 mod now_playing;
+mod sound_shadow;
 use crate::data::config::SortCriteria;
 use crate::data::Track;
 use crate::error::Error;
@@ -55,6 +56,7 @@ pub mod preferences;
 #[cfg(debug_assertions)]
 mod preview;
 pub mod queue;
+mod sidebar;
 #[cfg(debug_assertions)]
 pub use preview::run_if_requested;
 pub mod recommend;
@@ -76,6 +78,12 @@ pub fn main_window(config: &Config) -> WindowDesc<AppState> {
         .window_size(config.window_size)
         .show_title(false)
         .transparent_titlebar(true);
+    #[cfg(windows)]
+    let win = if crate::controller::taskbar::startup_in_tray(config) {
+        win.set_window_state(druid_shell::WindowState::Minimized)
+    } else {
+        win
+    };
     if cfg!(target_os = "macos") {
         win.menu(menu::main_menu)
     } else {
@@ -229,7 +237,7 @@ pub fn artwork_widget() -> impl Widget<AppState> {
 }
 
 fn root_widget() -> impl Widget<AppState> {
-    let playlists = Scroll::new(playlist::list_widget())
+    let playlists = Scroll::new(playlist::list_widget().padding_right(16.0))
         .vertical()
         .expand_height();
 
@@ -252,10 +260,16 @@ fn root_widget() -> impl Widget<AppState> {
         .fix_height(56.0)
         .background(Border::Top.with_color(theme::GREY_500));
 
-    let sidebar = Flex::column()
+    let expanded_sidebar = Flex::column()
         .with_flex_child(playlists, 1.0)
         .with_child(controls)
         .background(theme::BACKGROUND_DARK);
+
+    let sidebar = playlist::list_controller(Either::new(
+        |state: &AppState, _| state.config.library_compact,
+        sidebar::compact(),
+        expanded_sidebar,
+    ));
 
     let topbar = Flex::row()
         .must_fill_main_axis(true)
@@ -296,7 +310,8 @@ fn root_widget() -> impl Widget<AppState> {
                     ),
                 )
                 .split_point(0.62)
-                .bar_size(8.0)
+                .bar_size(1.0)
+                .min_bar_area(8.0)
                 .min_size(300.0, 260.0)
                 .solid_bar(true),
                 Overlay::bottom(route_widget(), alert_widget()),
@@ -305,28 +320,38 @@ fn root_widget() -> impl Widget<AppState> {
         )
         .background(theme::BACKGROUND_LIGHT);
 
-    let split = Split::columns(sidebar, main)
-        .split_point(0.27)
-        .bar_size(8.0)
-        .min_size(235.0, 500.0)
-        .min_bar_area(1.0)
-        .solid_bar(true);
+    let split = Flex::row()
+        .with_child(sidebar.fix_width(sidebar::WIDTH))
+        .with_flex_child(main, 1.0)
+        .env_scope(|env, state: &AppState| {
+            env.set(
+                sidebar::WIDTH,
+                if state.config.library_compact {
+                    72.0
+                } else {
+                    260.0
+                },
+            );
+        });
 
     let shell = Flex::column()
         .with_child(global_navigation_widget())
         .with_flex_child(split, 1.0)
         .with_child(
-            Flex::row()
-                .with_flex_child(playback::panel_widget(), 1.0)
-                .with_child(volume_slider().fix_width(180.0).center().fix_height(88.0))
-                .background(theme::BACKGROUND_DARK),
+            sound_shadow::SoundShadow::new(
+                Flex::row()
+                    .with_flex_child(playback::panel_widget(), 1.0)
+                    .with_child(volume_slider().fix_width(180.0).center().fix_height(88.0)),
+            )
+            .background(theme::BACKGROUND_DARK),
         );
 
     #[cfg(target_os = "windows")]
     let shell = shell.controller(crate::controller::taskbar::TaskbarController::default());
 
-    let shell =
-        shell.controller(crate::controller::native_connect::NativeConnectController::default());
+    let shell = user::profile_controller(
+        shell.controller(crate::controller::native_connect::NativeConnectController::default()),
+    );
 
     folders::controller(crate::controller::cache_hint::widget(connect::controller(
         news::controller(
@@ -414,7 +439,7 @@ fn route_widget() -> impl Widget<AppState> {
             Route::Devices => connect::widget().boxed(),
             Route::Notifications => news::widget().boxed(),
             Route::Queue => queue::widget().boxed(),
-            Route::Home => Scroll::new(home::home_widget().padding(theme::grid(1.0)))
+            Route::Home => Scroll::new(home::home_widget().padding(theme::SCROLL_CONTENT_INSETS))
                 .vertical()
                 .boxed(),
             Route::Lyrics => lyrics::lyrics_widget().boxed(),
@@ -424,41 +449,59 @@ fn route_widget() -> impl Widget<AppState> {
                         .lens(AppState::finder),
                 )
                 .with_flex_child(
-                    Scroll::new(library::saved_tracks_widget().padding(theme::grid(1.0)))
-                        .vertical(),
+                    Scroll::new(
+                        library::saved_tracks_widget().padding(theme::SCROLL_CONTENT_INSETS),
+                    )
+                    .vertical(),
                     1.0,
                 )
                 .boxed(),
             Route::SavedAlbums => {
-                Scroll::new(library::saved_albums_widget().padding(theme::grid(1.0)))
+                Scroll::new(library::saved_albums_widget().padding(theme::SCROLL_CONTENT_INSETS))
                     .vertical()
                     .boxed()
             }
-            Route::Shows => Scroll::new(library::saved_shows_widget().padding(theme::grid(1.0)))
-                .vertical()
+            Route::Shows => {
+                Scroll::new(library::saved_shows_widget().padding(theme::SCROLL_CONTENT_INSETS))
+                    .vertical()
+                    .boxed()
+            }
+            Route::SearchResults => search::results_widget()
+                .padding(theme::SCROLL_CONTENT_INSETS)
                 .boxed(),
-            Route::SearchResults => search::results_widget().padding(theme::grid(1.0)).boxed(),
-            Route::AlbumDetail => Scroll::new(album::detail_widget().padding(theme::grid(1.0)))
-                .vertical()
-                .boxed(),
-            Route::ArtistDetail => Scroll::new(artist::detail_widget().padding(theme::grid(1.0)))
-                .vertical()
-                .boxed(),
+            Route::AlbumDetail => {
+                Scroll::new(album::detail_widget().padding(theme::SCROLL_CONTENT_INSETS))
+                    .vertical()
+                    .boxed()
+            }
+            Route::ArtistDetail => {
+                Scroll::new(artist::detail_widget().padding(theme::SCROLL_CONTENT_INSETS))
+                    .vertical()
+                    .boxed()
+            }
             Route::PlaylistDetail => Flex::column()
+                .with_child(
+                    playlist::play_button()
+                        .padding((8.0, 8.0, 24.0, 8.0))
+                        .align_left(),
+                )
                 .with_child(
                     find::finder_widget(cmd::FIND_IN_PLAYLIST, "Find in Playlist...")
                         .lens(AppState::finder),
                 )
                 .with_flex_child(
-                    Scroll::new(playlist::detail_widget().padding(theme::grid(1.0))).vertical(),
+                    Scroll::new(playlist::detail_widget().padding(theme::SCROLL_CONTENT_INSETS))
+                        .vertical(),
                     1.0,
                 )
                 .boxed(),
-            Route::ShowDetail => Scroll::new(show::detail_widget().padding(theme::grid(1.0)))
-                .vertical()
-                .boxed(),
+            Route::ShowDetail => {
+                Scroll::new(show::detail_widget().padding(theme::SCROLL_CONTENT_INSETS))
+                    .vertical()
+                    .boxed()
+            }
             Route::Recommendations => {
-                Scroll::new(recommend::results_widget().padding(theme::grid(1.0)))
+                Scroll::new(recommend::results_widget().padding(theme::SCROLL_CONTENT_INSETS))
                     .vertical()
                     .boxed()
             }
@@ -471,10 +514,15 @@ fn sidebar_menu_widget() -> impl Widget<AppState> {
     Flex::column()
         .with_default_spacer()
         .with_child(
-            Label::new("Tu biblioteca")
-                .with_font(theme::UI_FONT_MEDIUM)
-                .with_text_size(18.0)
-                .align_left()
+            Flex::row()
+                .with_flex_child(
+                    Label::new("Tu biblioteca")
+                        .with_font(theme::UI_FONT_MEDIUM)
+                        .with_text_size(18.0)
+                        .align_left(),
+                    1.0,
+                )
+                .with_child(sidebar::toggle(false))
                 .padding((16.0, 8.0)),
         )
         .with_child(

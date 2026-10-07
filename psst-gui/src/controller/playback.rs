@@ -690,9 +690,15 @@ where
             Event::Command(cmd) if cmd.is(cmd::QUEUE_CHANGED) => {
                 let (upcoming, snapshot) = cmd.get_unchecked(cmd::QUEUE_CHANGED);
                 data.engine_queue = Some(snapshot.clone());
+                let mut entries = std::collections::HashMap::new();
+                for entry in data.playback.queue.iter().chain(data.added_queue.iter()) {
+                    entries
+                        .entry(entry.item.id())
+                        .or_insert_with(|| entry.clone());
+                }
                 data.playback.up_next = upcoming
                     .iter()
-                    .filter_map(|id| data.queued_entry(*id))
+                    .filter_map(|id| entries.get(id).cloned())
                     .collect();
                 ctx.set_handled();
             }
@@ -1000,6 +1006,11 @@ where
         data: &AppState,
         env: &Env,
     ) {
+        if old_data.config.audio_quality != data.config.audio_quality {
+            self.send(PlayerEvent::Command(PlayerCommand::Configure {
+                config: data.config.playback(),
+            }));
+        }
         if !old_data.playback.volume.same(&data.playback.volume) {
             self.set_volume(data.playback.volume);
         }

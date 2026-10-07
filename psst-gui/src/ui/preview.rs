@@ -52,6 +52,7 @@ pub fn run_if_requested() -> bool {
         return false;
     };
     let mut config = Config::default();
+    config.native_connect = false;
     if std::env::args().any(|arg| arg == "--dark") {
         config.theme = Theme::Dark;
     } else if std::env::args().any(|arg| arg == "--light") {
@@ -121,7 +122,7 @@ pub fn run_if_requested() -> bool {
             }
             crate::splitify::window()
         }
-        "queue" | "queue-empty" | "lyrics" | "lyrics-follow" | "menus" => {
+        "queue" | "queue-large" | "queue-empty" | "lyrics" | "lyrics-follow" | "menus" => {
             if view == "menus" {
                 fixture_library(&mut state);
             }
@@ -157,6 +158,25 @@ pub fn run_if_requested() -> bool {
                         state.playback.up_next.push_back(entry);
                     }
                 }
+            }
+            if view == "queue-large" {
+                let template = state
+                    .playback
+                    .up_next
+                    .front()
+                    .cloned()
+                    .expect("queue fixture");
+                state.playback.up_next = (0..5000)
+                    .map(|index| {
+                        let mut entry = template.clone();
+                        if let crate::data::Playable::Track(track) = &mut entry.item {
+                            let track = Arc::make_mut(track);
+                            track.name = format!("Canción de prueba {}", index + 1).into();
+                            track.id.0.id = index as u128 + 1;
+                        }
+                        entry
+                    })
+                    .collect();
             }
             if matches!(view.as_str(), "lyrics" | "lyrics-follow") {
                 state.nav = crate::data::Nav::Lyrics;
@@ -297,6 +317,38 @@ pub fn run_if_requested() -> bool {
             );
             state.playback.state = crate::data::PlaybackState::Paused;
             state.playback.up_next = state.playback.queue.iter().skip(613).cloned().collect();
+            super::main_window(&state.config)
+        }
+        "home-scroll" => {
+            let playlists = (0..12).map(|index| {
+                serde_json::from_value(serde_json::json!({
+                    "id":format!("preview-playlist-{index}"),
+                    "name":format!("Daily Mix {}", index + 1),
+                    "description":"Feid, Jowell & Randy, Rauw Alejandro and more music for your day.",
+                    "owner":{"id":"preview","display_name":"Angel"},
+                    "public":false,"collaborative":false,"images":[],"items":{"total":50}
+                })).unwrap()
+            }).collect();
+            state.home_detail.made_for_you.resolve(
+                (),
+                crate::data::MixedView {
+                    title: "Made For Angelo".into(),
+                    playlists,
+                    albums: Default::default(),
+                    artists: Default::default(),
+                    shows: Default::default(),
+                },
+            );
+            state.home_detail.jump_back_in.resolve(
+                (),
+                crate::data::MixedView {
+                    title: "Jump back in".into(),
+                    playlists: Default::default(),
+                    albums: Default::default(),
+                    artists: Default::default(),
+                    shows: Default::default(),
+                },
+            );
             super::main_window(&state.config)
         }
         "player" => super::main_window(&state.config),
