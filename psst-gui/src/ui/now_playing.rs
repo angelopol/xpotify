@@ -63,7 +63,7 @@ pub fn widget() -> impl Widget<AppState> {
                         .now_playing
                         .as_ref()
                         .map(|np| match &np.item {
-                            crate::data::Playable::Track(track) => track.artist_name().to_string(),
+                            crate::data::Playable::Track(track) => track.artist_names(),
                             crate::data::Playable::Episode(episode) => {
                                 episode.show.name.to_string()
                             }

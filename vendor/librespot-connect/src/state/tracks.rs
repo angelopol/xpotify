@@ -108,6 +108,28 @@ impl<'ct> ConnectState {
             self.set_repeat_track(false);
         }
 
+        let uri = self.current_track(|t| t.uri.clone());
+        self.shuffle_consumed.insert(uri);
+        if self.shuffling_context() {
+            let consumed = &self.shuffle_consumed;
+            self.request
+                .device
+                .mut_or_insert_default()
+                .player_state
+                .mut_or_insert_default()
+                .next_tracks
+                .retain(|t| t.is_queue() || !consumed.contains(&t.uri));
+            self.fill_up_next_tracks()?;
+            if self.next_tracks().is_empty()
+                && self
+                    .get_context(ContextType::Default)?
+                    .tracks
+                    .iter()
+                    .any(|t| !t.is_unavailable())
+            {
+                self.restart_shuffle_cycle()?;
+            }
+        }
         let old_track = self.player_mut().track.take();
 
         if let Some(old_track) = old_track {
@@ -133,8 +155,6 @@ impl<'ct> ConnectState {
             Some(t) => t,
         };
 
-        self.fill_up_next_tracks()?;
-
         let update_index = if new_track.is_queue() {
             None
         } else if new_track.is_autoplay() {
@@ -157,6 +177,9 @@ impl<'ct> ConnectState {
         }
 
         self.set_track(new_track);
+        self.shuffle_consumed
+            .insert(self.current_track(|t| t.uri.clone()));
+        self.fill_up_next_tracks()?;
         self.update_restrictions();
 
         Ok(Some(self.player().index.track))
@@ -289,7 +312,7 @@ impl<'ct> ConnectState {
         while self.next_tracks().len() < SPOTIFY_MAX_NEXT_TRACKS_SIZE {
             let ctx = self.get_context(self.fill_up_context)?;
             let track = match ctx.tracks.get(new_index) {
-                None if self.repeat_context() => {
+                None if self.repeat_context() && !self.shuffling_context() => {
                     let delimiter = Self::new_delimiter(iteration.into());
                     iteration += 1;
                     new_index = 0;
@@ -322,7 +345,13 @@ impl<'ct> ConnectState {
                     }
                 }
                 None => break,
-                Some(ct) if ct.is_unavailable() || self.is_skip_track(ct, Some(iteration)) => {
+                Some(ct)
+                    if ct.is_unavailable()
+                        || self.is_skip_track(ct, Some(iteration))
+                        || (self.shuffling_context()
+                            && (self.shuffle_consumed.contains(&ct.uri)
+                                || self.next_tracks().iter().any(|t| t.uri == ct.uri))) =>
+                {
                     debug!(
                         "skipped track {} during fillup as it's unavailable or should be skipped",
                         ct.uri
@@ -360,6 +389,27 @@ impl<'ct> ConnectState {
         };
 
         SpotifyUri::from_uri(next).ok()
+    }
+
+    /// The local UI can browse the full context; Spotify's wire queue stays capped at 80.
+    pub fn local_queue_state(&self) -> crate::protocol::player::PlayerState {
+        let mut player = self.player().clone();
+        if let Ok(ctx) = self.get_context(self.fill_up_context) {
+            let mut seen: std::collections::HashSet<_> = self.shuffle_consumed.clone();
+            seen.insert(player.track.uri.clone());
+            for track in &player.next_tracks {
+                seen.insert(track.uri.clone());
+            }
+            player.next_tracks.extend(
+                ctx.tracks
+                    .iter()
+                    .skip(ctx.index.track as usize)
+                    .filter(|t| !t.is_unavailable() && !self.is_skip_track(t, Some(ctx.index.page)))
+                    .filter(|t| !self.shuffling_context() || seen.insert(t.uri.clone()))
+                    .cloned(),
+            );
+        }
+        player
     }
 
     pub fn has_next_tracks(&self, min: Option<usize>) -> bool {
@@ -435,5 +485,106 @@ impl<'ct> ConnectState {
             self.update_queue_revision();
         }
         self.update_restrictions();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{protocol::connect::Device, state::context::StateContext};
+    use std::collections::{HashMap, HashSet};
+
+    fn state(count: usize, shuffle: bool) -> ConnectState {
+        let mut state = ConnectState::default();
+        state.request.device = MessageField::some(Device {
+            player_state: MessageField::some(Default::default()),
+            ..Default::default()
+        });
+        let tracks: Vec<_> = (0..count)
+            .map(|i| ProvidedTrack {
+                uri: format!("spotify:track:{i:022}"),
+                uid: format!("track-{i}"),
+                provider: Provider::Context.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        state.context = Some(StateContext {
+            tracks: tracks.into(),
+            metadata: HashMap::new(),
+            restrictions: None,
+            index: Default::default(),
+        });
+        state.set_current_track(0).unwrap();
+        state.set_shuffle(shuffle);
+        if shuffle {
+            state.shuffle_new().unwrap();
+        } else {
+            state.reset_playback_to_position(Some(0)).unwrap();
+        }
+        state
+    }
+
+    #[test]
+    fn full_local_queue_is_selectable_beyond_spotify_window() {
+        for shuffle in [false, true] {
+            let mut state = state(240, shuffle);
+            let displayed = state.local_queue_state().next_tracks;
+            assert_eq!(state.next_tracks().len(), 80);
+            assert_eq!(displayed.len(), 239);
+            for expected in displayed {
+                assert!(state.next_track().unwrap().is_some());
+                assert_eq!(state.player().track.uid, expected.uid);
+            }
+            if shuffle {
+                assert!(state.next_track().unwrap().is_some());
+            } else {
+                assert!(state.next_track().unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn shuffle_cycles_do_not_repeat_and_forward_skips_survive_reshuffle() {
+        let mut state = state(150, true);
+        let mut consumed = HashSet::new();
+        consumed.insert(state.player().track.uri.clone());
+        for _ in 0..49 {
+            state.next_track().unwrap();
+            assert!(consumed.insert(state.player().track.uri.clone()));
+        }
+        state.shuffle_new().unwrap();
+        let upcoming = state.local_queue_state().next_tracks;
+        assert_eq!(upcoming.len(), 100);
+        assert!(upcoming.iter().all(|t| !consumed.contains(&t.uri)));
+        for _ in 0..100 {
+            state.next_track().unwrap();
+            assert!(consumed.insert(state.player().track.uri.clone()));
+        }
+        let last = state.player().track.uri.clone();
+        for cycle in 0..3 {
+            let mut seen = HashSet::new();
+            for i in 0..150 {
+                assert!(state.next_track().unwrap().is_some());
+                if cycle == 0 && i == 0 {
+                    assert_ne!(state.player().track.uri, last);
+                }
+                assert!(seen.insert(state.player().track.uri.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_context_songs_play_once_per_shuffle_cycle() {
+        let mut state = state(5, true);
+        let duplicate = state.context.as_ref().unwrap().tracks[2].clone();
+        state.context.as_mut().unwrap().tracks.push(duplicate);
+        state.shuffle_new().unwrap();
+        let mut seen = HashSet::new();
+        seen.insert(state.player().track.uri.clone());
+        for _ in 0..4 {
+            state.next_track().unwrap();
+            assert!(seen.insert(state.player().track.uri.clone()));
+        }
+        assert!(state.next_track().unwrap().is_some());
     }
 }

@@ -65,7 +65,7 @@ fn playing_item_widget() -> impl Widget<NowPlaying> {
             Label::raw()
                 .with_line_break_mode(LineBreaking::Clip)
                 .with_text_size(theme::TEXT_SIZE_SMALL)
-                .lens(Track::lens_artist_name().in_arc()),
+                .lens(Track::lens_artist_names().in_arc()),
         )
         .episode(
             Label::raw()

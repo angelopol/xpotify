@@ -66,6 +66,7 @@ enum Action {
     Toggle,
     Next,
     Previous,
+    PreviousTrack,
     Seek(u32),
     Volume(u16),
     Behavior(QueueBehavior),
@@ -277,6 +278,7 @@ impl Worker {
                                 Some(Action::Toggle) => spirc.play_pause(),
                                 Some(Action::Next) => spirc.next(),
                                 Some(Action::Previous) => spirc.prev(),
+                                Some(Action::PreviousTrack) => spirc.prev_track(),
                                 Some(Action::Seek(ms)) => spirc.set_position_ms(ms),
                                 Some(Action::Volume(value)) => spirc.set_volume(value),
                                 Some(Action::Behavior(behavior)) => spirc.shuffle(behavior == QueueBehavior::Random)
@@ -1198,6 +1200,8 @@ impl<W: Widget<AppState>> Controller<AppState, W> for NativeConnectController {
                     Some(Action::Next)
                 } else if command.is(cmd::PLAY_PREVIOUS) {
                     Some(Action::Previous)
+                } else if command.is(cmd::PLAY_PREVIOUS_TRACK) {
+                    Some(Action::PreviousTrack)
                 } else if let Some(position) = command.get(cmd::SKIP_TO_POSITION) {
                     Some(Action::Seek((*position).min(u32::MAX as u64) as u32))
                 } else if let Some(fraction) = command.get(cmd::PLAY_SEEK) {

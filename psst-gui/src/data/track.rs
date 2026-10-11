@@ -35,9 +35,9 @@ pub struct Track {
 }
 
 impl Track {
-    pub fn lens_artist_name() -> impl Lens<Self, Arc<str>> {
+    pub fn lens_artist_names() -> impl Lens<Self, Arc<str>> {
         Map::new(
-            |track: &Self| track.artist_name(),
+            |track: &Self| track.artist_names().into(),
             |_, _| {
                 // Immutable.
             },

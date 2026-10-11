@@ -168,6 +168,7 @@ impl Player {
             PlayerCommand::Resume => self.resume(),
             PlayerCommand::PauseOrResume => self.pause_or_resume(),
             PlayerCommand::Previous => self.previous(),
+            PlayerCommand::PreviousTrack => self.previous_track(),
             PlayerCommand::Next => self.next(),
             PlayerCommand::SelectUpcoming { index, expected } => {
                 if self.queue.select_upcoming(index, expected) {
@@ -425,12 +426,7 @@ impl Player {
     fn previous(&mut self) {
         self.start_position = Duration::ZERO;
         if self.is_near_playback_start() {
-            self.queue.skip_to_previous();
-            if let Some(&item) = self.queue.get_current() {
-                self.load_and_play(item);
-            } else {
-                self.stop();
-            }
+            self.previous_track();
         } else {
             self.seek(Duration::default());
         }
@@ -439,6 +435,16 @@ impl Player {
     fn next(&mut self) {
         self.start_position = Duration::ZERO;
         self.queue.skip_to_next();
+        if let Some(&item) = self.queue.get_current() {
+            self.load_and_play(item);
+        } else {
+            self.stop();
+        }
+    }
+
+    fn previous_track(&mut self) {
+        self.start_position = Duration::ZERO;
+        self.queue.skip_to_previous();
         if let Some(&item) = self.queue.get_current() {
             self.load_and_play(item);
         } else {
@@ -518,6 +524,7 @@ pub enum PlayerCommand {
     Resume,
     PauseOrResume,
     Previous,
+    PreviousTrack,
     Next,
     SelectUpcoming {
         index: usize,

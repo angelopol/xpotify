@@ -5,6 +5,7 @@ use crate::{
         ConnectState, StateError,
         context::{ContextType, ResetContext},
         metadata::Metadata,
+        provider::IsProvider,
     },
 };
 use protobuf::MessageField;
@@ -82,6 +83,8 @@ impl ConnectState {
     }
 
     fn shuffle(&mut self, seed: u64, initial_track: &str) -> Result<(), Error> {
+        self.shuffle_consumed
+            .insert(self.current_track(|t| t.uri.clone()));
         self.clear_prev_track();
         self.clear_next_tracks();
 
@@ -97,6 +100,21 @@ impl ConnectState {
         self.fill_up_next_tracks()?;
 
         Ok(())
+    }
+
+    /// Start another cycle only after the pending traversal has been exhausted.
+    pub(super) fn restart_shuffle_cycle(&mut self) -> Result<(), Error> {
+        let current = self.current_track(|t| t.uri.clone());
+        self.shuffle_consumed.clear();
+        self.reset_context(ResetContext::DefaultIndex);
+        let ctx = self.get_context_mut(ContextType::Default)?;
+        let seed = rand::rng().random::<u64>();
+        // Keep the boundary between cycles from repeating the same song.
+        ctx.tracks
+            .shuffle_with_seed(seed, |t| t.uri != current && !t.is_unavailable());
+        ctx.set_initial_track("");
+        ctx.set_shuffle_seed(seed);
+        self.fill_up_next_tracks()
     }
 
     pub fn shuffling_context(&self) -> bool {

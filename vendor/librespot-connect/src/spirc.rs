@@ -123,6 +123,7 @@ enum SpircCommand {
     PlayPause,
     Pause,
     Prev,
+    PrevTrack,
     Next,
     VolumeUp,
     VolumeDown,
@@ -337,6 +338,11 @@ impl Spirc {
     /// Does nothing if we are not the active device.
     pub fn prev(&self) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::Prev)?)
+    }
+
+    /// Skip to the previous song regardless of the current playback position.
+    pub fn prev_track(&self) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::PrevTrack)?)
     }
 
     /// Skips to the next track.
@@ -588,14 +594,14 @@ impl SpircTask {
                 else => break
             }
             if self.connect_state.is_active() {
-                let player = self.connect_state.player();
+                let player = self.connect_state.local_queue_state();
                 let unchanged = self
                     .queue_state
                     .borrow()
                     .as_ref()
-                    .is_some_and(|old| same_queue(old, player));
+                    .is_some_and(|old| same_queue(old, &player));
                 if !unchanged {
-                    self.queue_state.send_replace(Some(player.clone()));
+                    self.queue_state.send_replace(Some(player));
                 }
             } else {
                 self.queue_state
@@ -708,16 +714,17 @@ impl SpircTask {
             SpircCommand::Play => self.handle_play(),
             SpircCommand::PlayPause => self.handle_play_pause(),
             SpircCommand::Pause => self.handle_pause(),
-            SpircCommand::Prev => self.handle_prev()?,
+            SpircCommand::Prev => self.handle_prev(false)?,
+            SpircCommand::PrevTrack => self.handle_prev(true)?,
             SpircCommand::Next => self.handle_next(None)?,
             SpircCommand::PlayQueued { uid, uri } => {
-                let limit = queued_occurrence(self.connect_state.player(), &uid, &uri).ok_or_else(
-                    || {
+                let limit = queued_occurrence(&self.connect_state.local_queue_state(), &uid, &uri)
+                    .ok_or_else(|| {
                         Error::failed_precondition(
                             "La cola cambió. Selecciona de nuevo la canción.",
                         )
-                    },
-                )? + 1;
+                    })?
+                    + 1;
                 let mut found = false;
                 for _ in 0..limit {
                     self.connect_state.next_track()?;
@@ -1163,7 +1170,7 @@ impl SpircTask {
                 }
             }
             SkipNext(skip_next) => self.handle_next(skip_next.track.map(|t| t.uri))?,
-            SkipPrev(_) => self.handle_prev()?,
+            SkipPrev(_) => self.handle_prev(false)?,
             Resume(_) if matches!(self.play_status, SpircPlayStatus::Stopped) => {
                 self.load_track(true, 0)?
             }
@@ -1722,11 +1729,11 @@ impl SpircTask {
         }
     }
 
-    fn handle_prev(&mut self) -> Result<(), Error> {
+    fn handle_prev(&mut self, force_track: bool) -> Result<(), Error> {
         // Previous behaves differently based on the position
         // Under 3s it goes to the previous song (starts playing)
         // Over 3s it seeks to zero (retains previous play status)
-        if self.position() < 3000 {
+        if force_track || self.position() < 3000 {
             let repeat_context = self.connect_state.repeat_context();
             match self.connect_state.prev_track()? {
                 None if repeat_context => self.connect_state.reset_playback_to_position(None)?,

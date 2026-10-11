@@ -484,7 +484,7 @@ impl<W: Widget<AppState>> Controller<AppState, W> for ConnectController {
                     kind = Some("pause");
                 } else if command.is(cmd::PLAY_NEXT) {
                     kind = Some("next");
-                } else if command.is(cmd::PLAY_PREVIOUS) {
+                } else if command.is(cmd::PLAY_PREVIOUS) || command.is(cmd::PLAY_PREVIOUS_TRACK) {
                     kind = Some("previous");
                 } else if let Some(position) = command.get(cmd::SKIP_TO_POSITION) {
                     kind = Some("seek");

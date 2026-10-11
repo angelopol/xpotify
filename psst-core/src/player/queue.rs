@@ -19,6 +19,8 @@ pub struct QueueSnapshot {
     pub user_items_position: usize,
     pub positions: Vec<usize>,
     pub behavior: QueueBehavior,
+    #[serde(default)]
+    pub consumed: Vec<crate::item_id::ItemId>,
 }
 
 #[derive(Clone)]
@@ -29,6 +31,7 @@ pub struct Queue {
     user_items_position: usize,
     positions: Vec<usize>,
     behavior: QueueBehavior,
+    consumed: Vec<crate::item_id::ItemId>,
 }
 
 impl Queue {
@@ -40,6 +43,7 @@ impl Queue {
             user_items_position: self.user_items_position,
             positions: self.positions.clone(),
             behavior: self.behavior.clone(),
+            consumed: self.consumed.clone(),
         }
     }
 
@@ -66,6 +70,7 @@ impl Queue {
         self.user_items_position = snapshot.user_items_position;
         self.positions = snapshot.positions;
         self.behavior = snapshot.behavior;
+        self.consumed = snapshot.consumed;
         true
     }
     pub fn new() -> Self {
@@ -76,10 +81,12 @@ impl Queue {
             user_items_position: 0,
             positions: Vec::new(),
             behavior: QueueBehavior::default(),
+            consumed: Vec::new(),
         }
     }
 
     pub fn clear(&mut self) {
+        self.consumed.clear();
         self.user_items.clear();
         self.user_items_position = 0;
         self.items.clear();
@@ -88,6 +95,7 @@ impl Queue {
     }
 
     pub fn fill(&mut self, items: Vec<PlaybackItem>, position: usize) {
+        self.consumed.clear();
         self.user_items.clear();
         self.user_items_position = 0;
         self.positions.clear();
@@ -137,7 +145,7 @@ impl Queue {
         let mut preview = self.clone();
         let mut upcoming = Vec::new();
         for _ in 0..count {
-            preview.skip_to_following();
+            preview.advance(false, false);
             let Some(item) = preview.get_current() else {
                 break;
             };
@@ -186,12 +194,18 @@ impl Queue {
             // Swap the current position with the first item, so we will start from the
             // beginning, with the full queue ahead of us.  Then shuffle the rest of the
             // items and set the position to 0.
-            if self.positions.len() > 1 {
-                let current = playlist_position.min(self.positions.len() - 1);
-                self.positions.swap(0, current);
-                self.positions[1..].shuffle(&mut rand::rng());
+            let current = playlist_position.min(self.positions.len().saturating_sub(1));
+            self.positions
+                .retain(|&i| i != current && self.consumed.contains(&self.items[i].item_id));
+            self.position = self.positions.len();
+            if !self.items.is_empty() {
+                self.positions.push(current);
             }
-            self.position = 0;
+            let mut remaining: Vec<_> = (0..self.items.len())
+                .filter(|&i| i != current && !self.consumed.contains(&self.items[i].item_id))
+                .collect();
+            remaining.shuffle(&mut rand::rng());
+            self.positions.extend(remaining);
         } else {
             self.position = playlist_position;
         }
@@ -202,23 +216,52 @@ impl Queue {
     }
 
     pub fn skip_to_next(&mut self) {
-        let had_current = self.get_current().is_some();
-        let inserted = self.handle_added_queue();
-        self.position = if !had_current {
-            inserted.unwrap_or_else(|| self.next_position())
-        } else {
-            self.next_position()
-        };
+        self.advance(true, true);
     }
 
     pub fn skip_to_following(&mut self) {
+        self.advance(false, true);
+    }
+
+    fn advance(&mut self, explicit_next: bool, restart: bool) {
+        if let Some(item) = self.get_current() {
+            let id = item.item_id;
+            if !self.consumed.contains(&id) {
+                self.consumed.push(id);
+            }
+        }
         let had_current = self.get_current().is_some();
         let inserted = self.handle_added_queue();
         self.position = if !had_current {
             inserted.unwrap_or_else(|| self.following_position())
+        } else if explicit_next {
+            self.next_position()
         } else {
             self.following_position()
         };
+        if matches!(self.behavior, QueueBehavior::Random) && inserted.is_none() {
+            while self
+                .get_current()
+                .is_some_and(|i| self.consumed.contains(&i.item_id))
+            {
+                self.position += 1;
+            }
+            if restart && self.position >= self.positions.len() && !self.items.is_empty() {
+                let last = self.consumed.last().copied();
+                self.consumed.clear();
+                self.positions.shuffle(&mut rand::rng());
+                if self.positions.len() > 1 && Some(self.items[self.positions[0]].item_id) == last {
+                    if let Some(i) = self
+                        .positions
+                        .iter()
+                        .position(|&i| Some(self.items[i].item_id) != last)
+                    {
+                        self.positions.swap(0, i);
+                    }
+                }
+                self.position = 0;
+            }
+        }
     }
 
     pub fn get_current(&self) -> Option<&PlaybackItem> {
@@ -285,6 +328,30 @@ mod tests {
     }
     fn ids(queue: &Queue) -> Vec<u128> {
         queue.upcoming_ids().iter().map(|id| id.id).collect()
+    }
+    #[test]
+    fn shuffle_continues_in_unique_cycles_and_remembers_skips() {
+        let mut queue = Queue::new();
+        queue.fill((1..=150).map(item).collect(), 0);
+        queue.set_behaviour(QueueBehavior::Random);
+        let initial = ids(&queue);
+        let skipped: Vec<_> = initial[..49].to_vec();
+        assert!(queue.select_upcoming(48, item(skipped[48]).item_id));
+        queue.set_behaviour(QueueBehavior::Random);
+        let rest = ids(&queue);
+        assert_eq!(rest.len(), 100);
+        assert!(rest.iter().all(|id| *id != 1 && !skipped.contains(id)));
+        for id in rest {
+            queue.skip_to_following();
+            assert_eq!(queue.get_current().unwrap().item_id.id, id);
+        }
+        for _ in 0..3 {
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..150 {
+                queue.skip_to_following();
+                assert!(seen.insert(queue.get_current().unwrap().item_id));
+            }
+        }
     }
     #[test]
     fn selecting_upcoming_preserves_the_remaining_shuffle_and_manual_order() {

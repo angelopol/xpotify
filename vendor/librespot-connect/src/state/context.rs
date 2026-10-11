@@ -114,6 +114,7 @@ impl ConnectState {
         match reset_as {
             ResetContext::WhenDifferent(_) => debug!("context didn't change, no reset"),
             ResetContext::Completely => {
+                self.shuffle_consumed.clear();
                 self.context = None;
                 self.autoplay_context = None;
 

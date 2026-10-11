@@ -112,6 +112,9 @@ pub(super) struct ConnectState {
 
     unavailable_uri: Vec<String>,
 
+    /// Songs consumed (including forward skips) in the current shuffle cycle.
+    shuffle_consumed: std::collections::HashSet<String>,
+
     active_since: Option<SystemTime>,
     queue_count: u64,
 

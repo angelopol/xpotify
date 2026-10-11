@@ -83,7 +83,7 @@ struct QueueRow {
 
 fn artist(item: &Playable) -> String {
     match item {
-        Playable::Track(track) => track.artist_name().to_string(),
+        Playable::Track(track) => track.artist_names(),
         Playable::Episode(episode) => episode.show.name.to_string(),
     }
 }

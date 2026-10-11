@@ -34,12 +34,17 @@ use crate::{
 };
 
 const AUDIO_FAILURE: druid::Selector<String> = druid::Selector::new("app.audio.failure");
+const MEDIA_CONTROL_EVENT: druid::Selector<(Instant, MediaControlEvent)> =
+    druid::Selector::new("app.media-control-event");
+use super::media_gesture::{GestureAction, MediaGesture, MediaPress};
 
 pub struct PlaybackController {
     sender: Option<Sender<PlayerEvent>>,
     thread: Option<JoinHandle<()>>,
     output: Option<DefaultAudioOutput>,
     media_controls: Option<MediaControls>,
+    media_gesture: MediaGesture,
+    media_gesture_timer: druid::TimerToken,
     has_scrobbled: bool,
     scrobbler: Option<Scrobbler>,
     startup: bool,
@@ -140,6 +145,8 @@ impl PlaybackController {
             thread: None,
             output: None,
             media_controls: None,
+            media_gesture: MediaGesture::default(),
+            media_gesture_timer: druid::TimerToken::INVALID,
             has_scrobbled: false,
             scrobbler: None,
             startup: true,
@@ -358,10 +365,36 @@ impl PlaybackController {
         })?;
 
         media_controls.attach(move |event| {
-            Self::handle_media_control_event(event, &sink);
+            let _ = sink.submit_command(
+                MEDIA_CONTROL_EVENT,
+                (Instant::now(), event),
+                druid::Target::Global,
+            );
         })?;
 
         Ok(media_controls)
+    }
+
+    fn submit_media_gesture(ctx: &mut EventCtx, action: GestureAction) {
+        let command = match action {
+            GestureAction::Single(MediaPress::Play) => cmd::PLAY_RESUME,
+            GestureAction::Single(MediaPress::Pause) => cmd::PLAY_PAUSE,
+            GestureAction::Single(MediaPress::Toggle) => cmd::PLAY_TOGGLE,
+            GestureAction::Next => cmd::PLAY_NEXT,
+            GestureAction::Previous => cmd::PLAY_PREVIOUS_TRACK,
+        };
+        ctx.submit_command(command.to(druid::Target::Global));
+        if matches!(action, GestureAction::Next | GestureAction::Previous) {
+            ctx.submit_command(cmd::PLAY_RESUME.to(druid::Target::Global));
+        }
+    }
+
+    fn schedule_media_gesture(&mut self, ctx: &mut EventCtx, now: Instant) {
+        self.media_gesture_timer = self
+            .media_gesture
+            .remaining(now)
+            .map(|remaining| ctx.request_timer(remaining))
+            .unwrap_or(druid::TimerToken::INVALID);
     }
 
     fn handle_media_control_event(event: MediaControlEvent, sink: &ExtEventSink) {
@@ -600,6 +633,44 @@ where
         data: &mut AppState,
         env: &Env,
     ) {
+        if let Event::Command(command) = event {
+            if let Some((pressed_at, media_event)) = command.get(MEDIA_CONTROL_EVENT) {
+                let press = match media_event {
+                    MediaControlEvent::Play => Some(MediaPress::Play),
+                    MediaControlEvent::Pause => Some(MediaPress::Pause),
+                    MediaControlEvent::Toggle => Some(MediaPress::Toggle),
+                    _ => None,
+                };
+                if let Some(press) = press {
+                    if let Some(action) = self.media_gesture.press(press, *pressed_at) {
+                        Self::submit_media_gesture(ctx, action);
+                    }
+                    self.schedule_media_gesture(ctx, Instant::now());
+                } else {
+                    self.media_gesture.cancel();
+                    self.media_gesture_timer = druid::TimerToken::INVALID;
+                    Self::handle_media_control_event(
+                        media_event.clone(),
+                        &ctx.get_external_handle(),
+                    );
+                }
+                ctx.set_handled();
+                return;
+            }
+        }
+        if matches!(event, Event::Timer(token) if *token == self.media_gesture_timer) {
+            let now = Instant::now();
+            if let Some(action) = self.media_gesture.finish(now) {
+                Self::submit_media_gesture(ctx, action);
+            }
+            self.schedule_media_gesture(ctx, now);
+            ctx.set_handled();
+            return;
+        }
+        if matches!(event, Event::WindowDisconnected) {
+            self.media_gesture.cancel();
+            self.media_gesture_timer = druid::TimerToken::INVALID;
+        }
         #[cfg(feature = "cpal")]
         if matches!(event, Event::Timer(token) if *token == self.audio_timer) {
             self.check_audio_device(ctx, data);
@@ -639,6 +710,7 @@ where
                     || command.is(cmd::PLAY_NEXT)
                     || command.is(cmd::PLAY_UPCOMING)
                     || command.is(cmd::PLAY_PREVIOUS)
+                    || command.is(cmd::PLAY_PREVIOUS_TRACK)
                 {
                     data.error_alert(
                         "Conecta una salida de audio. Xpotify la detectará automáticamente.",
@@ -799,6 +871,10 @@ where
             }
             Event::Command(cmd) if cmd.is(cmd::PLAY_PREVIOUS) => {
                 self.previous();
+                ctx.set_handled();
+            }
+            Event::Command(command) if command.is(cmd::PLAY_PREVIOUS_TRACK) => {
+                self.send(PlayerEvent::Command(PlayerCommand::PreviousTrack));
                 ctx.set_handled();
             }
             Event::Command(cmd) if cmd.is(cmd::PLAY_NEXT) => {
@@ -1015,7 +1091,9 @@ where
             self.set_volume(data.playback.volume);
         }
 
-        if data.connect.selected.is_some() && !old_data.playback.same(&data.playback) {
+        if (data.connect.selected.is_some() || data.config.native_connect)
+            && !old_data.playback.same(&data.playback)
+        {
             self.update_media_control_playback(&data.playback);
             self.update_media_control_metadata(&data.playback);
         }

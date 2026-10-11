@@ -2,7 +2,7 @@ param([switch]$Release)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $nativeRoot = [IO.Path]::GetFullPath($projectRoot)
-$targetRoot = Join-Path $nativeRoot 'target'
+$targetRoot = if ($env:CARGO_TARGET_DIR) { [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR) } else { Join-Path $nativeRoot 'target' }
 $cargoCommand = Get-Command cargo -ErrorAction SilentlyContinue
 $cargoPath = if ($cargoCommand) { $cargoCommand.Source } else { Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe' }
 if (-not (Test-Path -LiteralPath $cargoPath)) { throw 'Instala Rust desde https://rust-lang.org/tools/install y las herramientas C++ de Visual Studio.' }
