@@ -1,5 +1,14 @@
 # Local validation - Windows
 
+## Playlist loading limit and snapshot coverage, Windows (2026-10-14)
+
+- Diagnosed the installed metadata: La reports 2,502 entries and Us reports 3,679, while both revision-matching v2 snapshots contain only 500 tracks. The saved loading limit is already 4,000.
+- Playlist snapshots now record source entry coverage and total separately from playable tracks. Increasing the limit rebuilds incomplete snapshots using cached pages where available; decreasing it respects original source positions. Legacy snapshots cannot establish completeness. Empty or short pages before the advertised total return an error instead of becoming a complete snapshot.
+- Changing Max Loaded Tracks updates the API limit and clears the in-memory playlist result for the next playlist load, without requiring an application restart.
+- 96 offline tests pass (20 core, 76 GUI; two GUI integration tests remain ignored). Regression fixtures cover 2,502/3,679 entries, legacy caches of 500 tracks, increasing/decreasing limits, unavailable entries, duplicates, dates, original positions, and reuse of complete snapshots without page responses. Clippy passes with warnings denied; changed Rust files pass rustfmt and the diff passes whitespace checks.
+- The final optimized executable loaded all 2,502 tracks of La (26 pages) and all 3,679 tracks of Us (37 pages) from the actual account. Both last pages were reviewed in the running application. The saved playback snapshot hash, volume and 4,000 loading limit are unchanged; playback stays paused. The app is reopened on Us with the queue panel open.
+- Built with `scripts/Build-Native.ps1 -Release`, an external target under `D:\DevLibs`, ThinLTO and 16 codegen units. The root executable matches the compiled binary by SHA-256; root `target`, `dist` and `build` are absent. Existing user caches and versioned dependencies are preserved.
+
 ## Artist cards and two-week news window, Windows (2026-10-09)
 
 - News now shows one responsive card per artist, with release covers, type/date, unread counts, and links to the artist and individual albums. Artist IDs separate performers who share a display name. Artists and releases retain the feed's newest-first order.

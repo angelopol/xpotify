@@ -8,6 +8,7 @@ use crate::{
         AppState, AudioQuality, Authentication, Config, Preferences, PreferencesTab, Promise,
         SliderScrollScale, Theme,
     },
+    webapi::WebApi,
     widget::{icons, Async, Border, Checkbox, MyWidgetExt},
 };
 use druid::{
@@ -96,6 +97,7 @@ pub fn account_setup_widget() -> impl Widget<AppState> {
 
 pub fn preferences_widget() -> impl Widget<AppState> {
     const PROPAGATE_FLAGS: Selector = Selector::new("app.preferences.propagate-flags");
+    const PROPAGATE_TRACK_LIMIT: Selector = Selector::new("app.preferences.propagate-track-limit");
 
     Flex::column()
         .must_fill_main_axis(true)
@@ -126,6 +128,9 @@ pub fn preferences_widget() -> impl Widget<AppState> {
             if !old_data.config.same(&data.config) {
                 data.config.save();
             }
+            if old_data.config.paginated_limit != data.config.paginated_limit {
+                ctx.submit_command(PROPAGATE_TRACK_LIMIT);
+            }
 
             // Propagate some flags further to the state.
             if !old_data
@@ -138,6 +143,11 @@ pub fn preferences_widget() -> impl Widget<AppState> {
         })
         .on_command(PROPAGATE_FLAGS, |_, (), data| {
             data.common_ctx_mut().show_track_cover = data.config.show_track_cover;
+        })
+        .on_command(PROPAGATE_TRACK_LIMIT, |_, (), data| {
+            WebApi::global().set_paginated_limit(data.config.paginated_limit);
+            data.playlist_detail.playlist.clear();
+            data.playlist_detail.tracks.clear();
         })
         .scroll()
         .vertical()
@@ -327,7 +337,8 @@ fn general_tab_widget() -> impl Widget<AppState> {
 
     col = col
         .with_child(
-            Label::new("Max Loaded Tracks (requires restart)").with_font(theme::UI_FONT_MEDIUM),
+            Label::new("Max Loaded Tracks (applies when reopening a playlist)")
+                .with_font(theme::UI_FONT_MEDIUM),
         )
         .with_spacer(theme::grid(2.0))
         .with_child(

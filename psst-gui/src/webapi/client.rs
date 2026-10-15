@@ -4,7 +4,10 @@ use std::{
     hash::{Hash, Hasher},
     io::{self, Read},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -27,7 +30,7 @@ use psst_core::{
     },
     system_info::{OS, SPOTIFY_SEMANTIC_VERSION},
 };
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use std::sync::OnceLock;
 use time::{Date, Month};
@@ -690,7 +693,7 @@ pub struct WebApi {
     agent: Agent,
     cache: WebApiCache,
     local_track_manager: Mutex<LocalTrackManager>,
-    paginated_limit: usize,
+    paginated_limit: AtomicUsize,
     webapi_token: Mutex<Option<WebApiToken>>,
     response_origins: Mutex<HashMap<String, SystemTime>>,
     request_gate: Dispatcher,
@@ -728,7 +731,7 @@ impl WebApi {
             response_load: Loads::default(),
             read_failures: Mutex::new(HashMap::new()),
             local_track_manager: Mutex::new(LocalTrackManager::new()),
-            paginated_limit,
+            paginated_limit: AtomicUsize::new(paginated_limit),
             webapi_token: Mutex::new(None),
             webapi_client_id: Mutex::new(None),
             session: Mutex::new(None),
@@ -1148,11 +1151,16 @@ impl WebApi {
         Ok(())
     }
 
+    pub fn set_paginated_limit(&self, limit: usize) {
+        self.paginated_limit.store(limit, Ordering::Relaxed);
+    }
+
     fn invalidate_pages(&self, request: &RequestBuilder) -> Result<(), Error> {
-        for offset in (0..self.paginated_limit).step_by(50) {
+        let paginated_limit = self.paginated_limit.load(Ordering::Relaxed);
+        for offset in (0..paginated_limit).step_by(50) {
             let request = request
                 .clone()
-                .query("limit", 50.min(self.paginated_limit - offset))
+                .query("limit", 50.min(paginated_limit - offset))
                 .query("offset", offset);
             if let Some(key) = self.response_key(&request) {
                 self.cache.remove("responses", &key)?;
@@ -1290,8 +1298,9 @@ impl WebApi {
         mut func: impl FnMut(Page<T>) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let mut offset = 0;
-        while offset < self.paginated_limit {
-            let limit = 50.min(self.paginated_limit - offset);
+        let paginated_limit = self.paginated_limit.load(Ordering::Relaxed);
+        while offset < paginated_limit {
+            let limit = 50.min(paginated_limit - offset);
             let req = request
                 .clone()
                 .query("limit", limit)
@@ -1349,7 +1358,7 @@ impl WebApi {
                 let page_limit = page.limit;
                 func(page)?;
 
-                if page_total > offset && offset < self.paginated_limit {
+                if page_total > offset && offset < self.paginated_limit.load(Ordering::Relaxed) {
                     limit = page_limit;
                     offset = page_offset + page_limit;
                 } else {
@@ -2593,6 +2602,17 @@ impl WebApi {
     }
 }
 
+// Store coverage separately from playable tracks: null/unavailable entries still
+// consume playlist positions. Older snapshots did not record coverage and could
+// permanently reuse a collection truncated by a previous loading limit.
+#[derive(Deserialize, Serialize)]
+struct PlaylistSnapshot {
+    snapshot_id: Arc<str>,
+    loaded_items: usize,
+    total: usize,
+    tracks: Vec<(usize, Arc<Track>)>,
+}
+
 /// Playlist endpoints.
 impl WebApi {
     // https://developer.spotify.com/documentation/web-api/reference/get-a-list-of-current-users-playlists
@@ -2630,26 +2650,47 @@ impl WebApi {
             Method::Get,
             None,
         ));
+        let paginated_limit = self.paginated_limit.load(Ordering::Relaxed);
+        let request = &RequestBuilder::new(format!("v1/playlists/{id}/items"), Method::Get, None)
+            .query("marker", "from_token")
+            .query("additional_types", "track");
+        if paginated_limit == 0 {
+            return Ok(Vector::new());
+        }
         if let (Some(key), Some(snapshot)) = (&snapshot_key, &playlist.snapshot_id) {
-            if let Some(file) = self.cache.get("playlist-snapshots-v2", key) {
-                if let Ok((saved, items)) =
-                    serde_json::from_reader::<_, (String, Vec<(usize, Arc<Track>)>)>(file)
-                {
-                    if saved == snapshot.as_ref() {
-                        return Ok(items
+            if let Some(file) = self.cache.get("playlist-snapshots-v3", key) {
+                if let Ok(saved) = serde_json::from_reader::<_, PlaylistSnapshot>(file) {
+                    if saved.snapshot_id == *snapshot
+                        && playlist
+                            .track_count
+                            .is_none_or(|total| total == saved.total)
+                        && saved.loaded_items >= paginated_limit.min(saved.total)
+                    {
+                        return Ok(saved
+                            .tracks
                             .into_iter()
+                            .filter(|(position, _)| *position < paginated_limit)
                             .map(|(position, mut track)| {
                                 Arc::make_mut(&mut track).track_pos = position;
                                 track
                             })
                             .collect());
                     }
-                    // A new revision must never inherit still-fresh pages of the old revision.
-                    self.invalidate_pages(
-                        &RequestBuilder::new(format!("v1/playlists/{id}/items"), Method::Get, None)
-                            .query("marker", "from_token")
-                            .query("additional_types", "track"),
-                    )?;
+                    // Increasing the limit can reuse pages from the same revision.
+                    // A changed revision must never inherit those pages.
+                    if saved.snapshot_id != *snapshot {
+                        self.invalidate_pages(request)?;
+                    }
+                }
+            } else if let Some(file) = self.cache.get("playlist-snapshots-v2", key) {
+                // Legacy snapshots can identify old revisions, but cannot prove
+                // how many source entries were loaded. Rebuild from cached pages.
+                if let Ok((saved, _)) =
+                    serde_json::from_reader::<_, (Arc<str>, serde::de::IgnoredAny)>(file)
+                {
+                    if saved != *snapshot {
+                        self.invalidate_pages(request)?;
+                    }
                 }
             }
         }
@@ -2673,11 +2714,20 @@ impl WebApi {
             Json(serde_json::Value),
         }
 
-        let request = &RequestBuilder::new(format!("v1/playlists/{id}/items"), Method::Get, None)
-            .query("marker", "from_token")
-            .query("additional_types", "track");
-
-        let result: Vector<PlaylistItem> = self.load_all_pages(request)?;
+        let mut result: Vector<PlaylistItem> = Vector::new();
+        let mut total = playlist.track_count.unwrap_or(0);
+        self.for_all_pages(request, |page| {
+            let expected = page.limit.min(page.total.saturating_sub(page.offset));
+            if page.items.len() != expected {
+                return Err(Error::WebApiError(
+                    "Spotify devolvio una playlist incompleta. Actualiza la vista.".into(),
+                ));
+            }
+            total = page.total;
+            result.append(page.items);
+            Ok(())
+        })?;
+        let loaded_items = result.len();
 
         let local_track_manager = self.local_track_manager.lock();
 
@@ -2702,12 +2752,17 @@ impl WebApi {
             if let (Some(key), Some(snapshot)) = (snapshot_key, playlist.snapshot_id) {
                 let items: Vec<_> = tracks
                     .iter()
-                    .map(|track| (track.track_pos, track))
+                    .map(|track| (track.track_pos, track.clone()))
                     .collect();
                 self.cache.set(
-                    "playlist-snapshots-v2",
+                    "playlist-snapshots-v3",
                     &key,
-                    &serde_json::to_vec(&(snapshot, items))?,
+                    &serde_json::to_vec(&PlaylistSnapshot {
+                        snapshot_id: snapshot,
+                        loaded_items,
+                        total,
+                        tracks: items,
+                    })?,
                 );
             }
         }
@@ -3242,11 +3297,17 @@ mod efficiency_tests {
             "disc_number":1,"track_number":1,"explicit":false,"is_local":false,
             "playlist_added_at":"2026-01-02T00:00:00Z"
         })).unwrap();
-        let items = vec![(0usize, &track), (3usize, &track)];
+        let items = vec![(0usize, Arc::new(track.clone())), (3usize, Arc::new(track))];
         api.cache.set(
-            "playlist-snapshots-v2",
+            "playlist-snapshots-v3",
             &key,
-            &serde_json::to_vec(&("revision-a", items)).unwrap(),
+            &serde_json::to_vec(&PlaylistSnapshot {
+                snapshot_id: "revision-a".into(),
+                loaded_items: 4,
+                total: 4,
+                tracks: items,
+            })
+            .unwrap(),
         );
         let tracks = api.get_playlist_tracks(id).unwrap();
         assert_eq!(tracks.len(), 2);
@@ -3275,6 +3336,113 @@ mod efficiency_tests {
             Err(Error::RateLimited { .. })
         ));
         assert!(api.cache.get("responses", &page_key).is_none());
+    }
+
+    #[test]
+    fn playlists_expand_legacy_and_limited_snapshots_without_losing_positions() {
+        for total in [2502, 3679] {
+            for initial_limit in [500, 4000] {
+                let api = api();
+                api.set_paginated_limit(initial_limit);
+                let id = "fixture-playlist";
+                let metadata_request =
+                    RequestBuilder::new(format!("v1/playlists/{id}"), Method::Get, None);
+                let key = api.response_key(&metadata_request).unwrap();
+                api.cache.set(
+                    "responses",
+                    &key,
+                    &serde_json::to_vec(&json!({
+                        "id":id,"name":"Large playlist","description":"",
+                        "owner":{"id":"fixture-user","display_name":"Fixture"},
+                        "collaborative":false,"public":false,"snapshot_id":"revision-a",
+                        "items":{"total":total}
+                    }))
+                    .unwrap(),
+                );
+                let track = json!({
+                    "id":"7omij53d6AvXefx13NNyfn","name":"Repeated song","artists":[],
+                    "duration_ms":180000,"disc_number":1,"track_number":1,
+                    "explicit":false,"is_local":false
+                });
+                // Reproduce the installed cache: the revision matches, but only
+                // 500 tracks were saved before the loading limit was raised.
+                let legacy: Vec<_> = (0..500).map(|position| (position, track.clone())).collect();
+                api.cache.set(
+                    "playlist-snapshots-v2",
+                    &key,
+                    &serde_json::to_vec(&("revision-a", legacy)).unwrap(),
+                );
+                let request =
+                    RequestBuilder::new(format!("v1/playlists/{id}/items"), Method::Get, None)
+                        .query("marker", "from_token")
+                        .query("additional_types", "track");
+                for offset in (0..total).step_by(50) {
+                    let page = request.clone().query("limit", 50).query("offset", offset);
+                    let items: Vec<_> = (offset..total.min(offset + 50)).map(|position| {
+                        json!({"item":if position == 501 { serde_json::Value::Null } else { track.clone() },
+                            "added_at":"2026-01-02T00:00:00Z"})
+                    }).collect();
+                    api.cache.set(
+                        "responses",
+                        &api.response_key(&page).unwrap(),
+                        &serde_json::to_vec(
+                            &json!({"offset":offset,"limit":50,"total":total,"items":items}),
+                        )
+                        .unwrap(),
+                    );
+                }
+                let first = api.get_playlist_tracks(id).unwrap();
+                assert_eq!(
+                    first.len(),
+                    if initial_limit == 500 { 500 } else { total - 1 }
+                );
+                api.set_paginated_limit(4000);
+                let expanded = api.get_playlist_tracks(id).unwrap();
+                assert_eq!(expanded.len(), total - 1);
+                assert_eq!(expanded[500].track_pos, 500);
+                assert_eq!(expanded[501].track_pos, 502);
+                assert_eq!(expanded.last().unwrap().track_pos, total - 1);
+                assert_eq!(expanded[0].id, expanded[1].id);
+                assert_eq!(
+                    expanded.last().unwrap().playlist_added_at.as_deref(),
+                    Some("2026-01-02T00:00:00Z")
+                );
+                // Coverage includes the unavailable entry, so a complete snapshot
+                // remains usable even with all its page responses removed.
+                api.invalidate_pages(&request).unwrap();
+                assert_eq!(api.get_playlist_tracks(id).unwrap().len(), total - 1);
+                api.set_paginated_limit(100);
+                assert_eq!(api.get_playlist_tracks(id).unwrap().len(), 100);
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_playlist_pages_are_not_saved_as_complete_snapshots() {
+        let api = api();
+        let id = "incomplete-playlist";
+        let metadata = RequestBuilder::new(format!("v1/playlists/{id}"), Method::Get, None);
+        let key = api.response_key(&metadata).unwrap();
+        api.cache.set("responses", &key, &serde_json::to_vec(&json!({
+            "id":id,"name":"Incomplete","description":"",
+            "owner":{"id":"fixture-user","display_name":"Fixture"},
+            "collaborative":false,"public":false,"snapshot_id":"revision-a","items":{"total":2502}
+        })).unwrap());
+        let page = RequestBuilder::new(format!("v1/playlists/{id}/items"), Method::Get, None)
+            .query("marker", "from_token")
+            .query("additional_types", "track")
+            .query("offset", 0)
+            .query("limit", 50);
+        api.cache.set(
+            "responses",
+            &api.response_key(&page).unwrap(),
+            br#"{"offset":0,"limit":50,"total":2502,"items":[]}"#,
+        );
+        assert!(matches!(
+            api.get_playlist_tracks(id),
+            Err(Error::WebApiError(_))
+        ));
+        assert!(api.cache.get("playlist-snapshots-v3", &key).is_none());
     }
     #[test]
     fn repeated_transient_read_returns_same_error_without_network() {
