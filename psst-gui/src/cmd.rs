@@ -61,6 +61,7 @@ pub const PLAY_PAUSE: Selector = Selector::new("app.play-pause");
 pub const PLAY_RESUME: Selector = Selector::new("app.play-resume");
 pub const PLAY_NEXT: Selector = Selector::new("app.play-next");
 pub const PLAY_UPCOMING: Selector<(usize, ItemId)> = Selector::new("app.play-upcoming");
+pub const MOVE_UPCOMING: Selector<(usize, usize, Vec<ItemId>)> = Selector::new("app.move-upcoming");
 pub const DOWNLOAD_TRACK: Selector<Arc<Track>> = Selector::new("app.download-track");
 pub const PLAY_STOP: Selector = Selector::new("app.play-stop");
 pub const ADD_TO_QUEUE: Selector<(QueueEntry, PlaybackItem)> = Selector::new("app.add-to-queue");

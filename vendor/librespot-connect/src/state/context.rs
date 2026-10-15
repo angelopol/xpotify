@@ -114,6 +114,7 @@ impl ConnectState {
         match reset_as {
             ResetContext::WhenDifferent(_) => debug!("context didn't change, no reset"),
             ResetContext::Completely => {
+                self.reordered_tracks.clear();
                 self.shuffle_consumed.clear();
                 self.context = None;
                 self.autoplay_context = None;
@@ -123,6 +124,7 @@ impl ConnectState {
                 player.context_url.clear();
             }
             ResetContext::DefaultIndex => {
+                self.reordered_tracks.clear();
                 for ctx in [self.context.as_mut(), self.autoplay_context.as_mut()]
                     .into_iter()
                     .flatten()

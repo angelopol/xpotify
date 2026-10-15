@@ -58,7 +58,16 @@ enum Notice {
     LocalQueue(ClusterUpdate),
 }
 enum Action {
-    PlayQueued { uid: String, uri: String },
+    PlayQueued {
+        uid: String,
+        uri: String,
+    },
+    MoveQueued {
+        uid: String,
+        uri: String,
+        target_uid: String,
+        target_uri: String,
+    },
     Add(String),
     Load(LoadRequest),
     Play,
@@ -273,6 +282,7 @@ impl Worker {
                                 Some(Action::Load(request)) => spirc.activate().and_then(|_| spirc.load(request)),
                                 Some(Action::Add(uri)) => spirc.add_to_queue(uri),
                                 Some(Action::PlayQueued { uid, uri }) => spirc.play_queued(uid, uri),
+                                Some(Action::MoveQueued { uid, uri, target_uid, target_uri }) => spirc.move_queued(uid, uri, target_uid, target_uri),
                                 Some(Action::Play) => spirc.play(),
                                 Some(Action::Pause) => spirc.pause(),
                                 Some(Action::Toggle) => spirc.play_pause(),
@@ -1114,6 +1124,46 @@ impl<W: Widget<AppState>> Controller<AppState, W> for NativeConnectController {
                     ctx.set_handled();
                     return;
                 }
+                if let Some((from, to, expected)) = command.get(cmd::MOVE_UPCOMING) {
+                    let actual: Vec<_> =
+                        state.playback.up_next.iter().map(|q| q.item.id()).collect();
+                    if &actual == expected && !self.restore_pending {
+                        let tracks: Vec<_> =
+                            self.cluster
+                                .as_ref()
+                                .and_then(|u| u.cluster.as_ref())
+                                .and_then(|c| c.player_state.as_ref())
+                                .map(|p| {
+                                    p.next_tracks
+                                        .iter()
+                                        .filter(|t| {
+                                            psst_core::item_id::ItemId::from_uri(&t.uri)
+                                                .is_some_and(|id| {
+                                                    state.queued_entry(id).is_some()
+                                                        || from_provided(t).is_some()
+                                                })
+                                        })
+                                        .cloned()
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                        if let (Some(source), Some(target)) = (tracks.get(*from), tracks.get(*to)) {
+                            self.send(
+                                state,
+                                Action::MoveQueued {
+                                    uid: source.uid.clone(),
+                                    uri: source.uri.clone(),
+                                    target_uid: target.uid.clone(),
+                                    target_uri: target.uri.clone(),
+                                },
+                            );
+                        }
+                    } else {
+                        state.info_alert("Espera a que la cola se sincronice e intenta mover la canción otra vez.");
+                    }
+                    ctx.set_handled();
+                    return;
+                }
                 if let Some((index, expected)) = command.get(cmd::PLAY_UPCOMING) {
                     if state
                         .playback
@@ -1153,22 +1203,8 @@ impl<W: Widget<AppState>> Controller<AppState, W> for NativeConnectController {
                             ctx.set_handled();
                             return;
                         }
-                        let items = state
-                            .playback
-                            .up_next
-                            .iter()
-                            .skip(*index)
-                            .map(|q| q.item.clone())
-                            .collect();
-                        self.load(
-                            state,
-                            &PlaybackPayload {
-                                items,
-                                position: 0,
-                                origin: PlaybackOrigin::Home,
-                            },
-                            Duration::ZERO,
-                            true,
+                        state.info_alert(
+                            "Espera a que la cola se sincronice y selecciona la canción otra vez.",
                         );
                     } else {
                         state.error_alert("La cola cambió. Selecciona de nuevo la canción.");

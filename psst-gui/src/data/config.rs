@@ -138,6 +138,7 @@ pub struct Config {
     pub sort_order: SortOrder,
     pub sort_criteria: SortCriteria,
     pub paginated_limit: usize,
+    pub tracks_per_page: usize,
     pub seek_duration: usize,
     pub lastfm_session_key: Option<String>,
     pub lastfm_api_key: Option<String>,
@@ -179,6 +180,7 @@ impl Default for Config {
             sort_order: Default::default(),
             sort_criteria: Default::default(),
             paginated_limit: 5000,
+            tracks_per_page: 100,
             seek_duration: 10,
             lastfm_session_key: None,
             lastfm_api_key: None,
@@ -224,6 +226,7 @@ impl Config {
             let mut config: Config =
                 serde_json::from_reader(reader).expect("Failed to read config");
             migrate_audio_quality(&mut config);
+            config.tracks_per_page = config.tracks_per_page.clamp(1, 1000);
             Some(config)
         } else {
             None

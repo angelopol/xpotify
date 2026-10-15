@@ -17,33 +17,43 @@ use crate::{
 use super::{theme, utils};
 use std::sync::Arc;
 
-const PAGE_SIZE: usize = 50;
-
-fn page_range(len: usize, requested: usize) -> std::ops::Range<usize> {
-    let last_page = len.saturating_sub(1) / PAGE_SIZE;
-    let start = requested.min(last_page) * PAGE_SIZE;
-    start..start.saturating_add(PAGE_SIZE).min(len)
+fn page_range(len: usize, requested: usize, page_size: usize) -> std::ops::Range<usize> {
+    let page_size = page_size.clamp(1, 1000);
+    let last_page = len.saturating_sub(1) / page_size;
+    let start = requested.min(last_page) * page_size;
+    start..start.saturating_add(page_size).min(len)
 }
 
 pub fn pager() -> impl Widget<AppState> {
     Flex::row()
         .with_child(
-            Button::new("‹ 50")
+            Button::new("Anterior")
                 .on_click(|_, state: &mut AppState, _| {
-                    let page = page_range(state.playback.up_next.len(), state.queue_page).start
-                        / PAGE_SIZE;
+                    let page = page_range(
+                        state.playback.up_next.len(),
+                        state.queue_page,
+                        state.config.tracks_per_page,
+                    )
+                    .start
+                        / state.config.tracks_per_page.clamp(1, 1000);
                     state.queue_page = page.saturating_sub(1);
                 })
                 .disabled_if(|state, _| {
-                    page_range(state.playback.up_next.len(), state.queue_page).start == 0
+                    page_range(
+                        state.playback.up_next.len(),
+                        state.queue_page,
+                        state.config.tracks_per_page,
+                    )
+                    .start
+                        == 0
                 })
-                .tooltip("Ver las 50 canciones anteriores"),
+                .tooltip("Ver la página anterior"),
         )
         .with_spacer(4.0)
         .with_flex_child(
             Label::dynamic(|state: &AppState, _| {
                 let len = state.playback.up_next.len();
-                let range = page_range(len, state.queue_page);
+                let range = page_range(len, state.queue_page, state.config.tracks_per_page);
                 if len == 0 {
                     "0 canciones".to_owned()
                 } else {
@@ -57,19 +67,24 @@ pub fn pager() -> impl Widget<AppState> {
         )
         .with_spacer(4.0)
         .with_child(
-            Button::new("50 ›")
+            Button::new("Siguiente")
                 .on_click(|_, state: &mut AppState, _| {
                     let len = state.playback.up_next.len();
-                    let range = page_range(len, state.queue_page);
+                    let range = page_range(len, state.queue_page, state.config.tracks_per_page);
                     if range.end < len {
-                        state.queue_page = range.start / PAGE_SIZE + 1;
+                        state.queue_page =
+                            range.start / state.config.tracks_per_page.clamp(1, 1000) + 1;
                     }
                 })
                 .disabled_if(|state, _| {
-                    page_range(state.playback.up_next.len(), state.queue_page).end
-                        >= state.playback.up_next.len()
+                    page_range(
+                        state.playback.up_next.len(),
+                        state.queue_page,
+                        state.config.tracks_per_page,
+                    )
+                    .end >= state.playback.up_next.len()
                 })
-                .tooltip("Ver las siguientes 50 canciones"),
+                .tooltip("Ver la página siguiente"),
         )
         .expand_width()
 }
@@ -289,17 +304,33 @@ mod paging_tests {
     use super::*;
 
     #[test]
+    fn configurable_pages_default_to_one_hundred_and_bound_invalid_sizes() {
+        let config = crate::data::Config::default();
+        assert_eq!(page_range(250, 1, config.tracks_per_page), 100..200);
+        assert_eq!(page_range(250, 99, 100), 200..250);
+        assert_eq!(page_range(10, 1, 0), 1..2);
+        assert_eq!(page_range(2500, 1, usize::MAX), 1000..2000);
+        let old: crate::data::Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.tracks_per_page, 100);
+        let mut customized = old;
+        customized.tracks_per_page = 150;
+        let saved = serde_json::to_string(&customized).unwrap();
+        let restored: crate::data::Config = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.tracks_per_page, 150);
+    }
+
+    #[test]
     fn fifty_track_pages_cover_the_queue_and_clamp_after_it_shrinks() {
-        assert_eq!(page_range(0, usize::MAX), 0..0);
-        assert_eq!(page_range(49, 0), 0..49);
-        assert_eq!(page_range(50, 1), 0..50);
-        assert_eq!(page_range(51, 1), 50..51);
-        assert_eq!(page_range(125, 0), 0..50);
-        assert_eq!(page_range(125, 1), 50..100);
-        assert_eq!(page_range(125, 2), 100..125);
-        assert_eq!(page_range(125, usize::MAX), 100..125);
-        assert_eq!(page_range(17, 2), 0..17);
-        assert_eq!(page_range(usize::MAX, usize::MAX).end, usize::MAX);
+        assert_eq!(page_range(0, usize::MAX, 50), 0..0);
+        assert_eq!(page_range(49, 0, 50), 0..49);
+        assert_eq!(page_range(50, 1, 50), 0..50);
+        assert_eq!(page_range(51, 1, 50), 50..51);
+        assert_eq!(page_range(125, 0, 50), 0..50);
+        assert_eq!(page_range(125, 1, 50), 50..100);
+        assert_eq!(page_range(125, 2, 50), 100..125);
+        assert_eq!(page_range(125, usize::MAX, 50), 100..125);
+        assert_eq!(page_range(17, 2, 50), 0..17);
+        assert_eq!(page_range(usize::MAX, usize::MAX, 50).end, usize::MAX);
     }
 }
 

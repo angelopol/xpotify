@@ -21,6 +21,8 @@ pub struct QueueSnapshot {
     pub behavior: QueueBehavior,
     #[serde(default)]
     pub consumed: Vec<crate::item_id::ItemId>,
+    #[serde(default)]
+    pub manual_indices: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -32,6 +34,7 @@ pub struct Queue {
     positions: Vec<usize>,
     behavior: QueueBehavior,
     consumed: Vec<crate::item_id::ItemId>,
+    manual_indices: Vec<usize>,
 }
 
 impl Queue {
@@ -44,6 +47,7 @@ impl Queue {
             positions: self.positions.clone(),
             behavior: self.behavior.clone(),
             consumed: self.consumed.clone(),
+            manual_indices: self.manual_indices.clone(),
         }
     }
 
@@ -52,6 +56,10 @@ impl Queue {
             || snapshot.positions.len() != snapshot.items.len()
             || snapshot.user_items_position > snapshot.user_items.len()
             || snapshot.position > snapshot.positions.len()
+            || snapshot
+                .manual_indices
+                .iter()
+                .any(|&i| i >= snapshot.items.len())
         {
             return false;
         }
@@ -71,6 +79,7 @@ impl Queue {
         self.positions = snapshot.positions;
         self.behavior = snapshot.behavior;
         self.consumed = snapshot.consumed;
+        self.manual_indices = snapshot.manual_indices;
         true
     }
     pub fn new() -> Self {
@@ -82,10 +91,12 @@ impl Queue {
             positions: Vec::new(),
             behavior: QueueBehavior::default(),
             consumed: Vec::new(),
+            manual_indices: Vec::new(),
         }
     }
 
     pub fn clear(&mut self) {
+        self.manual_indices.clear();
         self.consumed.clear();
         self.user_items.clear();
         self.user_items_position = 0;
@@ -95,6 +106,7 @@ impl Queue {
     }
 
     pub fn fill(&mut self, items: Vec<PlaybackItem>, position: usize) {
+        self.manual_indices.clear();
         self.consumed.clear();
         self.user_items.clear();
         self.user_items_position = 0;
@@ -119,6 +131,7 @@ impl Queue {
         };
         let index = self.items.len();
         self.items.push(self.user_items[self.user_items_position]);
+        self.manual_indices.push(index);
         self.positions.insert(insertion, index);
         self.user_items_position += 1;
         Some(insertion)
@@ -166,9 +179,13 @@ impl Queue {
             return false;
         }
         let mut selected = self.clone();
-        for _ in 0..=index {
-            selected.skip_to_following();
+        if !matches!(selected.behavior, QueueBehavior::LoopTrack) {
+            let before = selected.upcoming_ids();
+            if !selected.move_upcoming(index, 0, &before) {
+                return false;
+            }
         }
+        selected.skip_to_following();
         if selected
             .get_current()
             .is_none_or(|item| item.item_id != expected)
@@ -176,6 +193,65 @@ impl Queue {
             return false;
         }
         *self = selected;
+        true
+    }
+
+    /// Move an occurrence in the visible traversal without restarting playback.
+    pub fn move_upcoming(
+        &mut self,
+        from: usize,
+        to: usize,
+        expected: &[crate::item_id::ItemId],
+    ) -> bool {
+        if from >= expected.len() || to >= expected.len() || self.upcoming_ids() != expected {
+            return false;
+        }
+        if from == to {
+            return true;
+        }
+        if self.get_current().is_none() {
+            let offset = self.user_items_position;
+            let moved = self.user_items.remove(offset + from);
+            self.user_items.insert(offset + to, moved);
+            return true;
+        }
+        if matches!(self.behavior, QueueBehavior::LoopTrack) {
+            return false;
+        }
+        let mut edited = self.clone();
+        let insertion = if edited.get_current().is_some() {
+            edited.position + 1
+        } else {
+            edited.positions.len()
+        };
+        let pending: Vec<_> = edited.user_items[edited.user_items_position..].to_vec();
+        let start = edited.items.len();
+        edited.items.extend(pending.iter().copied());
+        edited.manual_indices.extend(start..edited.items.len());
+        edited
+            .positions
+            .splice(insertion..insertion, start..edited.items.len());
+        edited.user_items_position = edited.user_items.len();
+        let mut preview = edited.clone();
+        let mut slots = Vec::new();
+        for expected_id in expected {
+            preview.advance(false, false);
+            if preview.get_current().map(|item| item.item_id) != Some(*expected_id) {
+                return false;
+            }
+            slots.push(preview.position);
+        }
+        // Repeat-all previews end at the currently playing occurrence.
+        if slots[from] == edited.position || slots[to] == edited.position {
+            return false;
+        }
+        let mut order: Vec<_> = slots.iter().map(|&slot| edited.positions[slot]).collect();
+        let moved = order.remove(from);
+        order.insert(to, moved);
+        for (slot, item) in slots.into_iter().zip(order) {
+            edited.positions[slot] = item;
+        }
+        *self = edited;
         true
     }
 
@@ -243,6 +319,10 @@ impl Queue {
             while self
                 .get_current()
                 .is_some_and(|i| self.consumed.contains(&i.item_id))
+                && !self
+                    .positions
+                    .get(self.position)
+                    .is_some_and(|i| self.manual_indices.contains(i))
             {
                 self.position += 1;
             }
@@ -330,6 +410,36 @@ mod tests {
         queue.upcoming_ids().iter().map(|id| id.id).collect()
     }
     #[test]
+    fn moving_occurrences_preserves_current_duplicates_and_persisted_order() {
+        for behavior in [
+            QueueBehavior::Sequential,
+            QueueBehavior::Random,
+            QueueBehavior::LoopAll,
+        ] {
+            let mut queue = Queue::new();
+            queue.fill((1..=8).map(item).collect(), 0);
+            queue.set_behaviour(behavior);
+            queue.add(item(90));
+            queue.add(item(90));
+            let current = queue.get_current().copied();
+            let before = queue.upcoming_ids();
+            let mut expected = before.clone();
+            let moved = expected.remove(1);
+            expected.insert(4, moved);
+            assert!(queue.move_upcoming(1, 4, &before));
+            assert_eq!(queue.get_current().copied(), current);
+            assert_eq!(queue.upcoming_ids(), expected);
+            assert!(!queue.move_upcoming(1, 4, &before));
+            let mut restored = Queue::new();
+            assert!(restored.restore(queue.snapshot()));
+            assert_eq!(restored.upcoming_ids(), expected);
+            for next in expected {
+                restored.skip_to_following();
+                assert_eq!(restored.get_current().unwrap().item_id, next);
+            }
+        }
+    }
+    #[test]
     fn shuffle_continues_in_unique_cycles_and_remembers_skips() {
         let mut queue = Queue::new();
         queue.fill((1..=150).map(item).collect(), 0);
@@ -339,8 +449,8 @@ mod tests {
         assert!(queue.select_upcoming(48, item(skipped[48]).item_id));
         queue.set_behaviour(QueueBehavior::Random);
         let rest = ids(&queue);
-        assert_eq!(rest.len(), 100);
-        assert!(rest.iter().all(|id| *id != 1 && !skipped.contains(id)));
+        assert_eq!(rest.len(), 148);
+        assert!(rest.iter().all(|id| *id != 1 && *id != skipped[48]));
         for id in rest {
             queue.skip_to_following();
             assert_eq!(queue.get_current().unwrap().item_id.id, id);
@@ -361,13 +471,11 @@ mod tests {
         queue.add(item(99));
         queue.add(item(99));
         let before = queue.upcoming_ids();
-        let mut traversal = queue.clone();
-        for _ in 0..4 {
-            traversal.skip_to_following();
-        }
+        let mut remaining = before.clone();
+        remaining.remove(3);
         assert!(queue.select_upcoming(3, before[3]));
-        assert_eq!(queue.get_current(), traversal.get_current());
-        assert_eq!(queue.upcoming_ids(), traversal.upcoming_ids());
+        assert_eq!(queue.get_current().unwrap().item_id, before[3]);
+        assert_eq!(queue.upcoming_ids(), remaining);
         let saved = serde_json::to_string(&queue.snapshot()).unwrap();
         assert!(!queue.select_upcoming(0, item(999).item_id));
         assert!(!queue.select_upcoming(5000, item(99).item_id));

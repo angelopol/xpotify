@@ -117,7 +117,16 @@ static SPIRC_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 enum SpircCommand {
-    PlayQueued { uid: String, uri: String },
+    PlayQueued {
+        uid: String,
+        uri: String,
+    },
+    MoveQueued {
+        uid: String,
+        uri: String,
+        target_uid: String,
+        target_uri: String,
+    },
     AddToQueue(String),
     Play,
     PlayPause,
@@ -131,7 +140,9 @@ enum SpircCommand {
     Shuffle(bool),
     Repeat(bool),
     RepeatTrack(bool),
-    Disconnect { pause: bool },
+    Disconnect {
+        pause: bool,
+    },
     SetPosition(u32),
     SetVolume(u16),
     Activate,
@@ -157,6 +168,21 @@ impl Spirc {
     pub fn play_queued(&self, uid: String, uri: String) -> Result<(), Error> {
         let _ = SpotifyUri::from_uri(&uri)?;
         Ok(self.commands.send(SpircCommand::PlayQueued { uid, uri })?)
+    }
+    /// Move an exact queued occurrence without restarting playback.
+    pub fn move_queued(
+        &self,
+        uid: String,
+        uri: String,
+        target_uid: String,
+        target_uri: String,
+    ) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::MoveQueued {
+            uid,
+            uri,
+            target_uid,
+            target_uri,
+        })?)
     }
     /// Add one manual item without replacing the context or restarting the song.
     pub fn add_to_queue(&self, uri: String) -> Result<(), Error> {
@@ -718,31 +744,37 @@ impl SpircTask {
             SpircCommand::PrevTrack => self.handle_prev(true)?,
             SpircCommand::Next => self.handle_next(None)?,
             SpircCommand::PlayQueued { uid, uri } => {
-                let limit = queued_occurrence(&self.connect_state.local_queue_state(), &uid, &uri)
+                let index = queued_occurrence(&self.connect_state.local_queue_state(), &uid, &uri)
                     .ok_or_else(|| {
                         Error::failed_precondition(
                             "La cola cambió. Selecciona de nuevo la canción.",
                         )
-                    })?
-                    + 1;
-                let mut found = false;
-                for _ in 0..limit {
-                    self.connect_state.next_track()?;
-                    if self
-                        .connect_state
-                        .current_track(|track| track.uid == uid && track.uri == uri)
-                    {
-                        found = true;
-                        break;
-                    }
+                    })?;
+                let first = self.connect_state.local_queue_state().next_tracks[0].clone();
+                if index > 0 {
+                    self.connect_state
+                        .move_queued(&uid, &uri, &first.uid, &first.uri)?;
                 }
-                if !found {
+                self.connect_state.next_track()?;
+                if !self
+                    .connect_state
+                    .current_track(|track| track.uid == uid && track.uri == uri)
+                {
                     return Err(Error::failed_precondition(
                         "La canción ya no está disponible en la cola.",
                     ));
                 }
                 self.add_autoplay_resolving_when_required();
                 self.load_track(true, 0)?;
+            }
+            SpircCommand::MoveQueued {
+                uid,
+                uri,
+                target_uid,
+                target_uri,
+            } => {
+                self.connect_state
+                    .move_queued(&uid, &uri, &target_uid, &target_uri)?;
             }
             SpircCommand::AddToQueue(uri) => {
                 if self

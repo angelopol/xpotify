@@ -114,6 +114,8 @@ pub(super) struct ConnectState {
 
     /// Songs consumed (including forward skips) in the current shuffle cycle.
     shuffle_consumed: std::collections::HashSet<String>,
+    /// Locally reordered context tracks beyond Spotify's 80-track wire window.
+    reordered_tracks: Vec<ProvidedTrack>,
 
     active_since: Option<SystemTime>,
     queue_count: u64,

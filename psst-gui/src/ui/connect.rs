@@ -380,6 +380,11 @@ impl<W: Widget<AppState>> Controller<AppState, W> for ConnectController {
                 return;
             }
             if state.connect.selected.is_some() {
+                if command.is(cmd::MOVE_UPCOMING) {
+                    state.info_alert("Para reordenar la cola, selecciona este equipo como dispositivo de reproducción.");
+                    ctx.set_handled();
+                    return;
+                }
                 if let Some((index, expected)) = command.get(cmd::PLAY_UPCOMING) {
                     if state
                         .playback

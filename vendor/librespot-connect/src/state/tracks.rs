@@ -15,6 +15,38 @@ use rand::Rng;
 pub const IDENTIFIER_DELIMITER: &str = "delimiter";
 
 impl<'ct> ConnectState {
+    /// Reorder an exact occurrence while leaving playback and history intact.
+    pub fn move_queued(
+        &mut self,
+        uid: &str,
+        uri: &str,
+        target_uid: &str,
+        target_uri: &str,
+    ) -> Result<(), Error> {
+        let mut tracks = self.local_queue_state().next_tracks;
+        let from = tracks.iter().position(|t| t.uid == uid && t.uri == uri);
+        let to = tracks
+            .iter()
+            .position(|t| t.uid == target_uid && t.uri == target_uri);
+        let (Some(from), Some(to)) = (from, to) else {
+            return Err(Error::failed_precondition(
+                "La cola cambió. Intenta mover la canción otra vez.",
+            ));
+        };
+        let track = tracks.remove(from);
+        tracks.insert(to, track);
+        let context_len = self.get_context(self.fill_up_context)?.tracks.len();
+        self.update_context_index(self.fill_up_context, context_len)?;
+        self.reordered_tracks = if tracks.len() > SPOTIFY_MAX_NEXT_TRACKS_SIZE {
+            tracks.split_off(SPOTIFY_MAX_NEXT_TRACKS_SIZE)
+        } else {
+            Vec::new()
+        };
+        self.player_mut().next_tracks = tracks;
+        self.update_queue_revision();
+        Ok(())
+    }
+
     fn new_delimiter(iteration: i64) -> ProvidedTrack {
         let mut delimiter = ProvidedTrack {
             uri: format!("spotify:{IDENTIFIER_DELIMITER}"),
@@ -256,6 +288,7 @@ impl<'ct> ConnectState {
     }
 
     pub fn set_next_tracks(&mut self, mut tracks: Vec<ProvidedTrack>) {
+        self.reordered_tracks.clear();
         // mobile only sends a set_queue command instead of an add_to_queue command
         // in addition to handling the mobile add_to_queue handling, this should also handle
         // a mass queue addition
@@ -290,6 +323,7 @@ impl<'ct> ConnectState {
     }
 
     pub fn clear_next_tracks(&mut self) {
+        self.reordered_tracks.clear();
         // respect queued track and don't throw them out of our next played tracks
         let first_non_queued_track = self
             .next_tracks()
@@ -310,6 +344,11 @@ impl<'ct> ConnectState {
         let mut iteration = ctx.index.page;
 
         while self.next_tracks().len() < SPOTIFY_MAX_NEXT_TRACKS_SIZE {
+            if !self.reordered_tracks.is_empty() {
+                let track = self.reordered_tracks.remove(0);
+                self.next_tracks_mut().push(track);
+                continue;
+            }
             let ctx = self.get_context(self.fill_up_context)?;
             let track = match ctx.tracks.get(new_index) {
                 None if self.repeat_context() && !self.shuffling_context() => {
@@ -394,6 +433,9 @@ impl<'ct> ConnectState {
     /// The local UI can browse the full context; Spotify's wire queue stays capped at 80.
     pub fn local_queue_state(&self) -> crate::protocol::player::PlayerState {
         let mut player = self.player().clone();
+        player
+            .next_tracks
+            .extend(self.reordered_tracks.iter().cloned());
         if let Ok(ctx) = self.get_context(self.fill_up_context) {
             let mut seen: std::collections::HashSet<_> = self.shuffle_consumed.clone();
             seen.insert(player.track.uri.clone());
@@ -477,9 +519,12 @@ impl<'ct> ConnectState {
             next_tracks.push(track)
         }
 
-        while next_tracks.len() > SPOTIFY_MAX_NEXT_TRACKS_SIZE {
-            next_tracks.pop();
-        }
+        let displaced = if next_tracks.len() > SPOTIFY_MAX_NEXT_TRACKS_SIZE {
+            next_tracks.split_off(SPOTIFY_MAX_NEXT_TRACKS_SIZE)
+        } else {
+            Vec::new()
+        };
+        self.reordered_tracks.splice(0..0, displaced);
 
         if rev_update {
             self.update_queue_revision();
@@ -541,6 +586,73 @@ mod tests {
                 assert!(state.next_track().unwrap().is_none());
             }
         }
+    }
+
+    #[test]
+    fn moving_and_selecting_beyond_wire_window_preserve_the_remaining_order() {
+        for shuffle in [false, true] {
+            let mut state = state(240, shuffle);
+            let current = state.player().track.clone();
+            let mut expected = state.local_queue_state().next_tracks;
+            let source = expected[180].clone();
+            let target = expected[4].clone();
+            state
+                .move_queued(&source.uid, &source.uri, &target.uid, &target.uri)
+                .unwrap();
+            let moved = expected.remove(180);
+            expected.insert(4, moved);
+            assert_eq!(state.player().track, current);
+            assert_eq!(state.local_queue_state().next_tracks, expected);
+            assert_eq!(state.next_tracks().len(), 80);
+            let selected = expected.remove(130);
+            let first = expected[0].clone();
+            state
+                .move_queued(&selected.uid, &selected.uri, &first.uid, &first.uri)
+                .unwrap();
+            state.next_track().unwrap();
+            assert_eq!(state.player().track.uid, selected.uid);
+            assert_eq!(state.local_queue_state().next_tracks, expected);
+            for next in expected {
+                state.next_track().unwrap();
+                assert_eq!(state.player().track.uid, next.uid);
+                assert!(state.next_tracks().len() <= 80);
+            }
+        }
+    }
+
+    #[test]
+    fn manual_duplicates_and_new_additions_survive_reordering() {
+        let mut state = state(160, true);
+        let duplicate = ProvidedTrack {
+            uri: "spotify:track:manual".into(),
+            ..Default::default()
+        };
+        state.add_to_queue(duplicate.clone(), true);
+        state.add_to_queue(duplicate.clone(), true);
+        let before = state.local_queue_state().next_tracks;
+        let source = before[1].clone();
+        let target = before[120].clone();
+        state
+            .move_queued(&source.uid, &source.uri, &target.uid, &target.uri)
+            .unwrap();
+        let mut expected = before;
+        let moved = expected.remove(1);
+        expected.insert(120, moved);
+        state.add_to_queue(
+            ProvidedTrack {
+                uri: "spotify:track:new".into(),
+                ..Default::default()
+            },
+            true,
+        );
+        let actual = state.local_queue_state().next_tracks;
+        assert_eq!(actual.len(), expected.len() + 1);
+        assert_eq!(actual.iter().filter(|t| t.uri == duplicate.uri).count(), 2);
+        let actual_without_new: Vec<_> = actual
+            .into_iter()
+            .filter(|t| t.uri != "spotify:track:new")
+            .collect();
+        assert_eq!(actual_without_new, expected);
     }
 
     #[test]

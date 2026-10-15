@@ -180,6 +180,10 @@ impl Player {
                     self.publish_queue();
                 }
             }
+            PlayerCommand::MoveUpcoming { from, to, expected } => {
+                self.queue.move_upcoming(from, to, &expected);
+                self.publish_queue();
+            }
             PlayerCommand::Stop => self.stop(),
             PlayerCommand::Seek { position } => self.seek(position),
             PlayerCommand::Configure { config } => self.configure(config),
@@ -529,6 +533,11 @@ pub enum PlayerCommand {
     SelectUpcoming {
         index: usize,
         expected: crate::item_id::ItemId,
+    },
+    MoveUpcoming {
+        from: usize,
+        to: usize,
+        expected: Vec<crate::item_id::ItemId>,
     },
     Stop,
     Seek {

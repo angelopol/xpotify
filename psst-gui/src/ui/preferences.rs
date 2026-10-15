@@ -133,16 +133,20 @@ pub fn preferences_widget() -> impl Widget<AppState> {
             }
 
             // Propagate some flags further to the state.
-            if !old_data
-                .config
-                .show_track_cover
-                .same(&data.config.show_track_cover)
+            if old_data.config.tracks_per_page != data.config.tracks_per_page
+                || !old_data
+                    .config
+                    .show_track_cover
+                    .same(&data.config.show_track_cover)
             {
                 ctx.submit_command(PROPAGATE_FLAGS);
             }
         })
         .on_command(PROPAGATE_FLAGS, |_, (), data| {
+            data.config.tracks_per_page = data.config.tracks_per_page.clamp(1, 1000);
             data.common_ctx_mut().show_track_cover = data.config.show_track_cover;
+            data.common_ctx_mut().tracks_per_page = data.config.tracks_per_page.clamp(1, 1000);
+            data.queue_page = 0;
         })
         .on_command(PROPAGATE_TRACK_LIMIT, |_, (), data| {
             WebApi::global().set_paginated_limit(data.config.paginated_limit);
@@ -351,6 +355,20 @@ fn general_tab_widget() -> impl Widget<AppState> {
                 .lens(AppState::config.then(Config::paginated_limit)),
         );
 
+    col = col
+        .with_spacer(theme::grid(3.0))
+        .with_child(
+            Label::new("Canciones por página (1–1000; predeterminado: 100)")
+                .with_font(theme::UI_FONT_MEDIUM),
+        )
+        .with_spacer(theme::grid(2.0))
+        .with_child(
+            TextBox::new()
+                .with_formatter(ParseFormatter::with_format_fn(|value: &usize| {
+                    value.to_string()
+                }))
+                .lens(AppState::config.then(Config::tracks_per_page)),
+        );
     col
 }
 

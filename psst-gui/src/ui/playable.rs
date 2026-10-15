@@ -49,13 +49,12 @@ where
     ControllerHost::new(PagedTracks::new(display, Some(selector)), PlayController)
 }
 
-const PAGE_SIZE: usize = 100;
-
 #[derive(Clone, Data, Lens)]
 struct TrackPage {
     rows: Vector<PlayRow<Playable>>,
     page: usize,
     total: usize,
+    page_size: usize,
 }
 
 fn page_bar() -> impl Widget<TrackPage> {
@@ -76,7 +75,7 @@ fn page_bar() -> impl Widget<TrackPage> {
                 format!(
                     "Página {} / {} · {} canciones",
                     data.page + 1,
-                    data.total.div_ceil(PAGE_SIZE).max(1),
+                    data.total.div_ceil(data.page_size).max(1),
                     data.total
                 )
             })
@@ -89,7 +88,7 @@ fn page_bar() -> impl Widget<TrackPage> {
                     data.page += 1;
                     ctx.request_update();
                 })
-                .disabled_if(|data, _| (data.page + 1) * PAGE_SIZE >= data.total),
+                .disabled_if(|data, _| (data.page + 1) * data.page_size >= data.total),
         )
         .padding((0.0, 10.0))
 }
@@ -127,6 +126,7 @@ impl<T: Data + PlayableIter> PagedTracks<T> {
                 rows: Vector::new(),
                 page: 0,
                 total: 0,
+                page_size: 100,
             },
             query: None,
             selector,
@@ -137,6 +137,11 @@ impl<T: Data + PlayableIter> PagedTracks<T> {
     }
 
     fn rebuild(&mut self, data: &WithCtx<T>) {
+        let page_size = data.ctx.tracks_per_page.clamp(1, 1000);
+        if self.page.page_size != page_size {
+            self.page.page = 0;
+            self.page.page_size = page_size;
+        }
         let filter = data.data.filter_query().trim();
         if self.last_filter != filter {
             self.page.page = 0;
@@ -175,7 +180,7 @@ impl<T: Data + PlayableIter> PagedTracks<T> {
         });
         if !self.last_playing.same(&data.ctx.now_playing) {
             if let Some(index) = matches.iter().position(|row| row.is_playing) {
-                self.page.page = index / PAGE_SIZE;
+                self.page.page = index / self.page.page_size;
             }
             self.last_playing = data.ctx.now_playing.clone();
         }
@@ -183,11 +188,11 @@ impl<T: Data + PlayableIter> PagedTracks<T> {
         self.page.page = self
             .page
             .page
-            .min(matches.len().saturating_sub(1) / PAGE_SIZE);
+            .min(matches.len().saturating_sub(1) / self.page.page_size);
         self.page.rows = matches
             .iter()
-            .skip(self.page.page * PAGE_SIZE)
-            .take(PAGE_SIZE)
+            .skip(self.page.page * self.page.page_size)
+            .take(self.page.page_size)
             .cloned()
             .collect();
     }

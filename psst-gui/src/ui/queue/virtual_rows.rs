@@ -1,7 +1,9 @@
 //! Keep widgets and artwork requests proportional to the viewport, not queue length.
 use super::{page_range, row, QueueRow};
+use crate::cmd;
 use crate::data::AppState;
-use druid::{widget::prelude::*, Point, Rect, WidgetExt, WidgetPod};
+use druid::{kurbo::Line, widget::prelude::*, Point, Rect, WidgetExt, WidgetPod};
+use psst_core::item_id::ItemId;
 
 const HEIGHT: f64 = 64.0;
 const OVERSCAN: usize = 2;
@@ -19,6 +21,7 @@ fn visible_range(clip: Rect, len: usize) -> std::ops::Range<usize> {
 pub(super) struct VirtualQueue {
     clip: Rect,
     children: Vec<(usize, WidgetPod<QueueRow, Box<dyn Widget<QueueRow>>>)>,
+    drag: Option<(usize, usize, Point, bool, Vec<ItemId>)>,
 }
 
 impl Default for VirtualQueue {
@@ -26,13 +29,18 @@ impl Default for VirtualQueue {
         Self {
             clip: Rect::new(0.0, 0.0, 1000.0, 800.0),
             children: Vec::new(),
+            drag: None,
         }
     }
 }
 
 impl VirtualQueue {
     fn data(data: &AppState, index: usize) -> Option<QueueRow> {
-        let range = page_range(data.playback.up_next.len(), data.queue_page);
+        let range = page_range(
+            data.playback.up_next.len(),
+            data.queue_page,
+            data.config.tracks_per_page,
+        );
         if !range.contains(&index) {
             return None;
         }
@@ -44,7 +52,11 @@ impl VirtualQueue {
     }
 
     fn reconcile(&mut self, data: &AppState) -> bool {
-        let page = page_range(data.playback.up_next.len(), data.queue_page);
+        let page = page_range(
+            data.playback.up_next.len(),
+            data.queue_page,
+            data.config.tracks_per_page,
+        );
         let local = visible_range(self.clip, page.len());
         let range = page.start + local.start..page.start + local.end;
         let old_len = self.children.len();
@@ -64,6 +76,64 @@ impl VirtualQueue {
 
 impl Widget<AppState> for VirtualQueue {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event, data: &mut AppState, env: &Env) {
+        let page = page_range(
+            data.playback.up_next.len(),
+            data.queue_page,
+            data.config.tracks_per_page,
+        );
+        match event {
+            Event::MouseDown(mouse)
+                if mouse.button.is_left() && ctx.is_hot() && !page.is_empty() =>
+            {
+                let index = page.start + (mouse.pos.y.max(0.0) / HEIGHT) as usize;
+                if index < page.end {
+                    self.drag = Some((
+                        index,
+                        index,
+                        mouse.pos,
+                        false,
+                        data.playback.up_next.iter().map(|q| q.item.id()).collect(),
+                    ));
+                    ctx.set_active(true);
+                    ctx.set_handled();
+                    return;
+                }
+            }
+            Event::MouseMove(mouse) if self.drag.is_some() => {
+                let (_, target, start, dragging, _) = self.drag.as_mut().unwrap();
+                *dragging |= mouse.pos.distance(*start) > 5.0;
+                *target = (page.start + (mouse.pos.y.max(0.0) / HEIGHT) as usize)
+                    .min(page.end.saturating_sub(1));
+                if *dragging {
+                    ctx.scroll_area_to_view(Rect::new(
+                        0.0,
+                        (mouse.pos.y - HEIGHT).max(0.0),
+                        1.0,
+                        mouse.pos.y + HEIGHT,
+                    ));
+                    ctx.request_paint();
+                }
+                ctx.set_handled();
+                return;
+            }
+            Event::MouseUp(mouse) if mouse.button.is_left() && self.drag.is_some() => {
+                let (from, to, _, dragging, expected) = self.drag.take().unwrap();
+                ctx.set_active(false);
+                if dragging && from != to {
+                    ctx.submit_command(cmd::MOVE_UPCOMING.with((from, to, expected)));
+                } else if !dragging && ctx.is_hot() {
+                    let actual: Vec<_> =
+                        data.playback.up_next.iter().map(|q| q.item.id()).collect();
+                    if actual == expected {
+                        ctx.submit_command(cmd::PLAY_UPCOMING.with((from, expected[from])));
+                    }
+                }
+                ctx.request_paint();
+                ctx.set_handled();
+                return;
+            }
+            _ => {}
+        }
         for (index, child) in &mut self.children {
             if let Some(mut row) = Self::data(data, *index) {
                 if child.is_initialized() {
@@ -96,9 +166,22 @@ impl Widget<AppState> for VirtualQueue {
     }
 
     fn update(&mut self, ctx: &mut UpdateCtx, old: &AppState, data: &AppState, env: &Env) {
-        let page_changed = page_range(old.playback.up_next.len(), old.queue_page).start
-            != page_range(data.playback.up_next.len(), data.queue_page).start;
-        if page_changed || !old.playback.up_next.same(&data.playback.up_next) {
+        let page_changed = page_range(
+            old.playback.up_next.len(),
+            old.queue_page,
+            old.config.tracks_per_page,
+        )
+        .start
+            != page_range(
+                data.playback.up_next.len(),
+                data.queue_page,
+                data.config.tracks_per_page,
+            )
+            .start;
+        if old.config.tracks_per_page != data.config.tracks_per_page
+            || page_changed
+            || !old.playback.up_next.same(&data.playback.up_next)
+        {
             if self.reconcile(data) {
                 ctx.children_changed();
             }
@@ -125,7 +208,11 @@ impl Widget<AppState> for VirtualQueue {
         env: &Env,
     ) -> Size {
         let width = bc.max().width;
-        let page = page_range(data.playback.up_next.len(), data.queue_page);
+        let page = page_range(
+            data.playback.up_next.len(),
+            data.queue_page,
+            data.config.tracks_per_page,
+        );
         let child_bc = BoxConstraints::tight(Size::new(width, HEIGHT));
         for (index, child) in &mut self.children {
             if let Some(row) = Self::data(data, *index) {
@@ -135,7 +222,13 @@ impl Widget<AppState> for VirtualQueue {
         }
         bc.constrain(Size::new(
             width,
-            page_range(data.playback.up_next.len(), data.queue_page).len() as f64 * HEIGHT,
+            page_range(
+                data.playback.up_next.len(),
+                data.queue_page,
+                data.config.tracks_per_page,
+            )
+            .len() as f64
+                * HEIGHT,
         ))
     }
 
@@ -143,6 +236,22 @@ impl Widget<AppState> for VirtualQueue {
         for (index, child) in &mut self.children {
             if let Some(row) = Self::data(data, *index) {
                 child.paint(ctx, &row, env);
+            }
+        }
+        if let Some((from, to, _, true, _)) = &self.drag {
+            let page = page_range(
+                data.playback.up_next.len(),
+                data.queue_page,
+                data.config.tracks_per_page,
+            );
+            if page.contains(to) {
+                let y = (to - page.start + usize::from(to > from)) as f64 * HEIGHT;
+                let width = ctx.size().width;
+                ctx.stroke(
+                    Line::new(Point::new(0.0, y), Point::new(width, y)),
+                    &env.get(super::theme::BLUE_200),
+                    3.0,
+                );
             }
         }
     }
@@ -167,6 +276,7 @@ mod tests {
             origin: PlaybackOrigin::Home,
         };
         state.playback.up_next = (0..125).map(|_| entry.clone()).collect();
+        state.config.tracks_per_page = 50;
         state.queue_page = 1;
         assert_eq!(VirtualQueue::data(&state, 50).unwrap().index, Some(50));
         assert_eq!(VirtualQueue::data(&state, 99).unwrap().index, Some(99));

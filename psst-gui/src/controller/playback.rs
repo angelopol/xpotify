@@ -889,6 +889,15 @@ where
                 }));
                 ctx.set_handled();
             }
+            Event::Command(command) if command.is(cmd::MOVE_UPCOMING) => {
+                let (from, to, expected) = command.get_unchecked(cmd::MOVE_UPCOMING);
+                self.send(PlayerEvent::Command(PlayerCommand::MoveUpcoming {
+                    from: *from,
+                    to: *to,
+                    expected: expected.clone(),
+                }));
+                ctx.set_handled();
+            }
             Event::Command(cmd) if cmd.is(cmd::PLAY_STOP) => {
                 self.stop();
                 ctx.set_handled();

@@ -125,6 +125,7 @@ impl AppState {
             playing_origin: None,
             library: Arc::clone(&library),
             show_track_cover: config.show_track_cover,
+            tracks_per_page: config.tracks_per_page.clamp(1, 1000),
             nav: Nav::Home,
         });
         let playback = Playback {
@@ -648,6 +649,7 @@ pub struct CommonCtx {
     pub playing_origin: Option<PlaybackOrigin>,
     pub library: Arc<Library>,
     pub show_track_cover: bool,
+    pub tracks_per_page: usize,
     pub nav: Nav,
 }
 
